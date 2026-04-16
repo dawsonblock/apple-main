@@ -172,6 +172,66 @@ def _streaming_attention_update_np(
     return new_max, running_sum, running_out
 
 
+def _pq_decode_np(
+    codes_np: np.ndarray,
+    codebooks_np: np.ndarray,
+    num_subspaces: int,
+    subspace_dim: int,
+) -> np.ndarray:
+    n = codes_np.shape[0]
+    out = np.zeros((n, num_subspaces * subspace_dim), dtype=np.float32)
+    codes_int = codes_np.astype(np.int32, copy=False)
+
+    for sub in range(num_subspaces):
+        s0 = sub * subspace_dim
+        s1 = s0 + subspace_dim
+        out[:, s0:s1] = codebooks_np[sub][codes_int[:, sub]]
+
+    return out
+
+
+def _rvq_decode_correction_np(
+    total_rows: int,
+    rvq_codes_np: np.ndarray,
+    rvq_offsets_np: np.ndarray,
+    codebooks_np: np.ndarray,
+    head_dim: int,
+) -> np.ndarray:
+    out = np.zeros((total_rows, head_dim), dtype=np.float32)
+    if rvq_offsets_np.size == 0 or codebooks_np.shape[0] == 0:
+        return out
+
+    if np.any(rvq_offsets_np < 0) or np.any(rvq_offsets_np >= total_rows):
+        raise ValueError("RVQ offsets must be valid row indices")
+
+    codes_int = rvq_codes_np.astype(np.int32, copy=False)
+    for layer in range(codebooks_np.shape[0]):
+        out[rvq_offsets_np] += codebooks_np[layer][codes_int[:, layer]]
+
+    return out
+
+
+def _hybrid_decode_np(
+    pq_codes_np: np.ndarray,
+    rvq_codes_np: np.ndarray,
+    rvq_offsets_np: np.ndarray,
+    pq_codebooks_np: np.ndarray,
+    rvq_codebooks_np: np.ndarray,
+    num_subspaces: int,
+    subspace_dim: int,
+    head_dim: int,
+) -> np.ndarray:
+    pq_recon = _pq_decode_np(pq_codes_np, pq_codebooks_np, num_subspaces, subspace_dim)
+    correction = _rvq_decode_correction_np(
+        pq_codes_np.shape[0],
+        rvq_codes_np,
+        rvq_offsets_np,
+        rvq_codebooks_np,
+        head_dim,
+    )
+    return pq_recon + correction
+
+
 class ProductQuantizerMLX(nn.Module):
     def __init__(self, config: RFSNConfig):
         _require_mlx()
@@ -452,6 +512,91 @@ class RFSNv10KVCacheMLX:
         data = np.load(path)
         return {k: _np_to_mx(np.array(v)) for k, v in data.items()}
 
+    def _validate_warm_block_token_ranges(
+        self,
+        warm_block_token_ranges: Optional[List[Tuple[int, int]]],
+    ) -> None:
+        if warm_block_token_ranges is None:
+            return
+
+        previous_end = 0
+        for index, block_range in enumerate(warm_block_token_ranges):
+            if len(block_range) != 2:
+                raise ValueError(f"Warm block range {index} must contain exactly two bounds")
+
+            start_token, end_token = block_range
+            if start_token < 0 or end_token > self.num_warm:
+                raise ValueError(f"Warm block range {index} is out of bounds for num_warm={self.num_warm}")
+            if start_token >= end_token:
+                raise ValueError(f"Warm block range {index} must have start < end")
+            if index > 0 and start_token < previous_end:
+                raise ValueError("Warm block token ranges must be sorted and non-overlapping")
+
+            previous_end = end_token
+
+    def _default_warm_block_token_ranges(self, block_size_tokens: int) -> List[Tuple[int, int]]:
+        return [
+            (start_token, min(self.num_warm, start_token + block_size_tokens))
+            for start_token in range(0, self.num_warm, block_size_tokens)
+        ]
+
+    def _build_blockwise_numpy_decode_state(self, quantizer: HybridQuantizerMLX) -> Dict[str, Any]:
+        return {
+            "pq_codebooks": _mx_to_np(quantizer.pq.codebooks, np.float32),
+            "rvq_codebooks": _mx_to_np(quantizer.rvq.codebooks, np.float32),
+            "key": {
+                "pq_codes": _mx_to_np(self.warm_key_pq_codes, np.uint8),
+                "rvq_codes": _mx_to_np(self.warm_key_rvq_codes, np.int32),
+                "rvq_offsets": _mx_to_np(self.warm_key_rvq_offsets, np.int32),
+            },
+            "value": {
+                "pq_codes": _mx_to_np(self.warm_value_pq_codes, np.uint8),
+                "rvq_codes": _mx_to_np(self.warm_value_rvq_codes, np.int32),
+                "rvq_offsets": _mx_to_np(self.warm_value_rvq_offsets, np.int32),
+            },
+        }
+
+    def _reconstruct_warm_component_block_numpy(
+        self,
+        component_state: Dict[str, np.ndarray],
+        decode_state: Dict[str, Any],
+        start_token: int,
+        end_token: int,
+    ) -> np.ndarray:
+        if start_token < 0 or end_token < start_token or end_token > int(component_state["pq_codes"].shape[0]):
+            raise ValueError("Warm block token range is invalid")
+
+        token_count = end_token - start_token
+        if token_count == 0:
+            return np.zeros((0, self.config.num_heads, self.config.head_dim), dtype=np.float32)
+
+        row_start = start_token * self.config.num_heads
+        row_end = end_token * self.config.num_heads
+        block_pq_codes = component_state["pq_codes"][start_token:end_token].reshape(
+            token_count * self.config.num_heads,
+            self.config.num_subspaces,
+        )
+
+        offsets_np = component_state["rvq_offsets"]
+        left = int(np.searchsorted(offsets_np, row_start, side="left"))
+        right = int(np.searchsorted(offsets_np, row_end, side="left"))
+        local_offsets = offsets_np[left:right] - row_start
+        if np.any(local_offsets < 0) or np.any(local_offsets >= token_count * self.config.num_heads):
+            raise ValueError("Local RVQ offsets must map inside the reconstructed warm block")
+
+        local_rvq_codes = component_state["rvq_codes"][left:right]
+        decoded = _hybrid_decode_np(
+            block_pq_codes,
+            local_rvq_codes,
+            local_offsets,
+            decode_state["pq_codebooks"],
+            decode_state["rvq_codebooks"],
+            self.config.num_subspaces,
+            self.config.subspace_dim,
+            self.config.head_dim,
+        )
+        return decoded.reshape(token_count, self.config.num_heads, self.config.head_dim)
+
     def reconstruct_warm_keys(self, quantizer: HybridQuantizerMLX):
         if self.num_warm == 0:
             return mx.zeros((0, self.config.num_heads, self.config.head_dim), dtype=_mx_dtype("float16"))
@@ -534,6 +679,7 @@ class RFSNv10KVCacheMLX:
         quantizer: HybridQuantizerMLX,
         warm_read_mode: str = "full",
         warm_block_size_tokens: Optional[int] = None,
+        warm_block_token_ranges: Optional[List[Tuple[int, int]]] = None,
         collect_metrics: bool = False,
     ) -> Tuple[Any, Dict[str, float | int | str]]:
         if warm_read_mode not in {"full", "blockwise"}:
@@ -542,6 +688,7 @@ class RFSNv10KVCacheMLX:
         block_size_tokens = self.config.block_size_seq if warm_block_size_tokens is None else warm_block_size_tokens
         if block_size_tokens <= 0:
             raise ValueError("warm_block_size_tokens must be positive")
+        self._validate_warm_block_token_ranges(warm_block_token_ranges)
 
         key_parts: List[np.ndarray] = []
         value_parts: List[np.ndarray] = []
@@ -662,15 +809,31 @@ class RFSNv10KVCacheMLX:
             if collect_metrics:
                 metrics["attention_ms"] = float(metrics["attention_ms"]) + (time.perf_counter() - attention_start) * 1000.0
 
-        for start_token in range(0, self.num_warm, block_size_tokens):
-            end_token = min(self.num_warm, start_token + block_size_tokens)
+        warm_ranges = (
+            self._default_warm_block_token_ranges(block_size_tokens)
+            if warm_block_token_ranges is None
+            else list(warm_block_token_ranges)
+        )
+        numpy_decode_state = self._build_blockwise_numpy_decode_state(quantizer) if warm_ranges else None
+
+        for start_token, end_token in warm_ranges:
             token_count = end_token - start_token
 
             if collect_metrics:
                 reconstruct_start = time.perf_counter()
 
-            warm_keys_np = _mx_to_np(self.reconstruct_warm_key_block(quantizer, start_token, end_token), np.float32)
-            warm_values_np = _mx_to_np(self.reconstruct_warm_value_block(quantizer, start_token, end_token), np.float32)
+            warm_keys_np = self._reconstruct_warm_component_block_numpy(
+                numpy_decode_state["key"],
+                numpy_decode_state,
+                start_token,
+                end_token,
+            )
+            warm_values_np = self._reconstruct_warm_component_block_numpy(
+                numpy_decode_state["value"],
+                numpy_decode_state,
+                start_token,
+                end_token,
+            )
 
             if collect_metrics:
                 metrics["warm_reconstruct_ms"] = float(metrics["warm_reconstruct_ms"]) + (time.perf_counter() - reconstruct_start) * 1000.0
@@ -717,12 +880,14 @@ class RFSNv10KVCacheMLX:
         quantizer: HybridQuantizerMLX,
         warm_read_mode: str = "full",
         warm_block_size_tokens: Optional[int] = None,
+        warm_block_token_ranges: Optional[List[Tuple[int, int]]] = None,
     ):
         out, _ = self._attention_forward_impl(
             q,
             quantizer,
             warm_read_mode=warm_read_mode,
             warm_block_size_tokens=warm_block_size_tokens,
+            warm_block_token_ranges=warm_block_token_ranges,
             collect_metrics=False,
         )
         return out
@@ -733,12 +898,14 @@ class RFSNv10KVCacheMLX:
         quantizer: HybridQuantizerMLX,
         warm_read_mode: str = "full",
         warm_block_size_tokens: Optional[int] = None,
+        warm_block_token_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> Tuple[Any, Dict[str, float | int | str]]:
         return self._attention_forward_impl(
             q,
             quantizer,
             warm_read_mode=warm_read_mode,
             warm_block_size_tokens=warm_block_size_tokens,
+            warm_block_token_ranges=warm_block_token_ranges,
             collect_metrics=True,
         )
 
@@ -1036,7 +1203,46 @@ def run_tests() -> bool:
     assert int(blockwise_metrics["warm_reconstruction_fp16_bytes"]) < int(profile_metrics["warm_reconstruction_fp16_bytes"])
     assert int(blockwise_metrics["warm_reconstruction_fp32_bytes"]) < int(profile_metrics["warm_reconstruction_fp32_bytes"])
 
-    logger.info("[12] Cold spill writes actual .npz files with expected fields")
+    logger.info("[12] Partial warm block selection matches dense reference over hot plus selected warm ranges")
+    selected_ranges = [(0, 1), (cache.num_warm - 1, cache.num_warm)]
+    partial_out_mx, partial_metrics = cache.attention_forward_profile(
+        _np_to_mx(combo_q, dtype=_mx_dtype("float16")),
+        quantizer,
+        warm_read_mode="blockwise",
+        warm_block_size_tokens=2,
+        warm_block_token_ranges=selected_ranges,
+    )
+    partial_out = _mx_to_np(partial_out_mx, np.float32)
+    selected_warm_keys = np.concatenate([
+        _mx_to_np(cache.reconstruct_warm_key_block(quantizer, start_token, end_token), np.float32)
+        for start_token, end_token in selected_ranges
+    ], axis=0)
+    selected_warm_values = np.concatenate([
+        _mx_to_np(cache.reconstruct_warm_value_block(quantizer, start_token, end_token), np.float32)
+        for start_token, end_token in selected_ranges
+    ], axis=0)
+    partial_ref = dense_attention_reference_np(
+        combo_q,
+        np.concatenate([_mx_to_np(cache.hot_keys, np.float32), selected_warm_keys], axis=0),
+        np.concatenate([_mx_to_np(cache.hot_values, np.float32), selected_warm_values], axis=0),
+    )
+    _assert_close("partial_blockwise_attention", partial_out, partial_ref, atol=2e-3, rtol=2e-3)
+    assert int(partial_metrics["warm_blocks"]) == len(selected_ranges)
+    assert int(partial_metrics["warm_decode_tokens"]) == sum(end - start for start, end in selected_ranges)
+
+    try:
+        cache.attention_forward_profile(
+            _np_to_mx(combo_q, dtype=_mx_dtype("float16")),
+            quantizer,
+            warm_read_mode="blockwise",
+            warm_block_size_tokens=2,
+            warm_block_token_ranges=[(0, 2), (1, 3)],
+        )
+        raise AssertionError("overlapping warm block token ranges should raise ValueError")
+    except ValueError:
+        pass
+
+    logger.info("[13] Cold spill writes actual .npz files with expected fields")
     with tempfile.TemporaryDirectory() as tmpdir:
         cold_cache = RFSNv10KVCacheMLX(config, layer_idx=0)
         large_keys = np.random.randn(20, config.num_heads, config.head_dim).astype(np.float32)
@@ -1070,13 +1276,13 @@ def run_tests() -> bool:
         }
         assert expected.issubset(set(chunk.keys()))
 
-        logger.info("[13] Router prefetch loads chunk files without crashing")
+        logger.info("[14] Router prefetch loads chunk files without crashing")
         router = AsyncHierarchicalRouterMLX(config, disk_dir=Path(tmpdir))
         loaded = asyncio.run(router.predict_and_prefetch(current_position=0, context_window=8192, top_k=2))
         assert isinstance(loaded, list)
         assert 0 in loaded or loaded == []
 
-    logger.info("[14] Memory usage accounting is finite")
+    logger.info("[15] Memory usage accounting is finite")
     usage = cache.memory_usage_bytes()
     for value in usage.values():
         assert isinstance(value, int)

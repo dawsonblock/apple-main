@@ -24,6 +24,8 @@ CSV_FIELDS = [
     "mode",
     "warm_read_mode",
     "warm_block_size_tokens",
+    "warm_selection_policy",
+    "warm_selection_blocks",
     "trial_index",
     "seed",
     "seq_len",
@@ -44,6 +46,8 @@ CSV_FIELDS = [
     "avg_warm_blocks",
     "peak_warm_blocks",
     "avg_warm_decode_tokens",
+    "avg_warm_coverage_ratio",
+    "avg_warm_tokens_per_processed_block",
     "avg_update_ms",
     "avg_dense_ms",
     "avg_cache_total_ms",
@@ -81,10 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-lengths", nargs="+", type=int, default=[2048, 4096])
     parser.add_argument("--modes", nargs="+", choices=["pq", "hybrid"], default=["pq", "hybrid"])
     parser.add_argument("--warm-read-modes", nargs="+", choices=["full", "blockwise"], default=["full"])
+    parser.add_argument("--warm-selection-policies", nargs="+", choices=["all", "recent"], default=["all"])
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--step-tokens", type=int, default=256)
     parser.add_argument("--warm-block-size", type=int, default=256)
+    parser.add_argument("--warm-selection-blocks", type=int, default=2)
     parser.add_argument("--query-batch", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -107,6 +113,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("step_tokens must be positive")
     if args.warm_block_size <= 0:
         raise ValueError("warm_block_size must be positive")
+    if args.warm_selection_blocks <= 0:
+        raise ValueError("warm_selection_blocks must be positive")
     if args.query_batch <= 0:
         raise ValueError("query_batch must be positive")
     if args.num_heads <= 0 or args.head_dim <= 0:
@@ -145,6 +153,27 @@ def sample_prefix_lengths(seq_len: int, step_tokens: int) -> List[int]:
     return positions
 
 
+def build_warm_block_ranges(num_warm: int, block_size_tokens: int) -> List[tuple[int, int]]:
+    return [
+        (start_token, min(num_warm, start_token + block_size_tokens))
+        for start_token in range(0, num_warm, block_size_tokens)
+    ]
+
+
+def select_warm_block_ranges(
+    num_warm: int,
+    block_size_tokens: int,
+    policy: str,
+    selection_blocks: int,
+) -> List[tuple[int, int]]:
+    all_ranges = build_warm_block_ranges(num_warm, block_size_tokens)
+    if policy == "all":
+        return all_ranges
+    if policy == "recent":
+        return all_ranges[-min(selection_blocks, len(all_ranges)) :]
+    raise ValueError(f"Unsupported warm selection policy: {policy}")
+
+
 def attention_scores_np(q: np.ndarray, k: np.ndarray) -> np.ndarray:
     if k.shape[0] == 0:
         return np.zeros((q.shape[0], q.shape[1], 0), dtype=np.float32)
@@ -161,14 +190,45 @@ def error_metrics(reference: np.ndarray, candidate: np.ndarray, prefix: str) -> 
     }
 
 
-def build_visible_cache_keys(cache: rfsn.RFSNv10KVCacheMLX, quantizer: rfsn.HybridQuantizerMLX) -> np.ndarray:
+def build_visible_cache_keys(
+    cache: rfsn.RFSNv10KVCacheMLX,
+    quantizer: rfsn.HybridQuantizerMLX,
+    warm_block_token_ranges: Sequence[tuple[int, int]] | None = None,
+) -> np.ndarray:
     key_parts: List[np.ndarray] = []
     if cache.num_hot > 0:
         key_parts.append(rfsn._mx_to_np(cache.hot_keys, np.float32))
     if cache.num_warm > 0:
-        key_parts.append(rfsn._mx_to_np(cache.reconstruct_warm_keys(quantizer), np.float32))
+        if warm_block_token_ranges is None:
+            key_parts.append(rfsn._mx_to_np(cache.reconstruct_warm_keys(quantizer), np.float32))
+        else:
+            for start_token, end_token in warm_block_token_ranges:
+                key_parts.append(
+                    rfsn._mx_to_np(cache.reconstruct_warm_key_block(quantizer, start_token, end_token), np.float32)
+                )
     if not key_parts:
         return np.zeros((0, cache.config.num_heads, cache.config.head_dim), dtype=np.float32)
+    return np.concatenate(key_parts, axis=0)
+
+
+def build_selected_dense_keys(
+    prefix_keys: np.ndarray,
+    hot_tokens: int,
+    warm_tokens: int,
+    warm_block_token_ranges: Sequence[tuple[int, int]] | None = None,
+) -> np.ndarray:
+    key_parts: List[np.ndarray] = []
+    if hot_tokens > 0:
+        key_parts.append(prefix_keys[:hot_tokens].astype(np.float32))
+    if warm_tokens > 0:
+        warm_slice = prefix_keys[hot_tokens:hot_tokens + warm_tokens].astype(np.float32)
+        if warm_block_token_ranges is None:
+            key_parts.append(warm_slice)
+        else:
+            for start_token, end_token in warm_block_token_ranges:
+                key_parts.append(warm_slice[start_token:end_token])
+    if not key_parts:
+        return np.zeros((0, prefix_keys.shape[1], prefix_keys.shape[2]), dtype=np.float32)
     return np.concatenate(key_parts, axis=0)
 
 
@@ -197,6 +257,7 @@ def run_trial(
     args: argparse.Namespace,
     mode: str,
     warm_read_mode: str,
+    warm_selection_policy: str,
     seq_len: int,
     trial_index: int,
 ) -> Dict[str, float | int | str]:
@@ -234,6 +295,8 @@ def run_trial(
         cold_spill_active = 0
         warm_blocks_values: List[float] = []
         warm_decode_tokens_values: List[float] = []
+        warm_coverage_ratio_values: List[float] = []
+        warm_tokens_per_block_values: List[float] = []
         cursor = 0
 
         for step_index, prefix_len in enumerate(prefix_lengths):
@@ -256,12 +319,22 @@ def run_trial(
             dense_output = rfsn.dense_attention_reference_np(query, keys[:prefix_len], values[:prefix_len])
             dense_ms_values.append((time.perf_counter() - dense_start) * 1000.0)
 
+            warm_block_token_ranges = None
+            if warm_read_mode == "blockwise":
+                warm_block_token_ranges = select_warm_block_ranges(
+                    cache.num_warm,
+                    args.warm_block_size,
+                    warm_selection_policy,
+                    args.warm_selection_blocks,
+                )
+
             cache_query = rfsn._np_to_mx(query, dtype=rfsn._mx_dtype("float16"))
             cache_output_mx, cache_metrics = cache.attention_forward_profile(
                 cache_query,
                 quantizer,
                 warm_read_mode=warm_read_mode,
                 warm_block_size_tokens=args.warm_block_size,
+                warm_block_token_ranges=warm_block_token_ranges,
             )
             cache_output = rfsn._mx_to_np(cache_output_mx, np.float32)
 
@@ -271,6 +344,13 @@ def run_trial(
             warm_reconstruct_ms_values.append(float(cache_metrics["warm_reconstruct_ms"]))
             warm_blocks_values.append(float(cache_metrics["warm_blocks"]))
             warm_decode_tokens_values.append(float(cache_metrics["warm_decode_tokens"]))
+
+            if cache.num_warm > 0:
+                warm_coverage_ratio_values.append(float(cache_metrics["warm_decode_tokens"]) / cache.num_warm)
+            if float(cache_metrics["warm_blocks"]) > 0.0:
+                warm_tokens_per_block_values.append(
+                    float(cache_metrics["warm_decode_tokens"]) / float(cache_metrics["warm_blocks"])
+                )
 
             output_metrics = error_metrics(dense_output, cache_output, "output")
             output_mse_values.append(output_metrics["output_mse"])
@@ -282,8 +362,17 @@ def run_trial(
                 score_l2_values.append(float("nan"))
                 score_linf_values.append(float("nan"))
             else:
-                dense_scores = attention_scores_np(query, keys[:prefix_len])
-                cache_scores = attention_scores_np(query, build_visible_cache_keys(cache, quantizer))
+                dense_score_keys = build_selected_dense_keys(
+                    keys[:prefix_len],
+                    cache.num_hot,
+                    cache.num_warm,
+                    warm_block_token_ranges,
+                )
+                dense_scores = attention_scores_np(query, dense_score_keys)
+                cache_scores = attention_scores_np(
+                    query,
+                    build_visible_cache_keys(cache, quantizer, warm_block_token_ranges),
+                )
                 score_metrics = error_metrics(dense_scores, cache_scores, "score")
                 score_mse_values.append(score_metrics["score_mse"])
                 score_l2_values.append(score_metrics["score_l2"])
@@ -321,6 +410,8 @@ def run_trial(
             "mode": mode,
             "warm_read_mode": warm_read_mode,
             "warm_block_size_tokens": args.warm_block_size,
+            "warm_selection_policy": warm_selection_policy,
+            "warm_selection_blocks": 0 if warm_selection_policy == "all" else args.warm_selection_blocks,
             "trial_index": trial_index,
             "seed": seed,
             "seq_len": seq_len,
@@ -341,6 +432,8 @@ def run_trial(
             "avg_warm_blocks": mean_or_zero(warm_blocks_values),
             "peak_warm_blocks": max_or_zero(warm_blocks_values),
             "avg_warm_decode_tokens": mean_or_zero(warm_decode_tokens_values),
+            "avg_warm_coverage_ratio": mean_or_zero(warm_coverage_ratio_values),
+            "avg_warm_tokens_per_processed_block": mean_or_zero(warm_tokens_per_block_values),
             "avg_update_ms": mean_or_zero(update_ms_values),
             "avg_dense_ms": mean_or_zero(dense_ms_values),
             "avg_cache_total_ms": mean_or_zero(cache_total_ms_values),
@@ -390,25 +483,28 @@ def main() -> None:
     for seq_len in args.sequence_lengths:
         for mode in args.modes:
             for warm_read_mode in args.warm_read_modes:
-                for trial_index in range(args.trials):
-                    row = run_trial(args, mode, warm_read_mode, seq_len, trial_index)
-                    rows.append(row)
-                    print(
-                        "mode={mode}/{warm_mode} seq={seq} trial={trial} dense_ms={dense:.3f} cache_ms={cache:.3f} "
-                        "warm_ms={warm:.3f} warm_blocks={blocks:.1f} output_mse={mse:.6e} warm_ratio={ratio:.2f} cold={cold}".format(
-                            mode=row["mode"],
-                            warm_mode=row["warm_read_mode"],
-                            seq=row["seq_len"],
-                            trial=row["trial_index"],
-                            dense=row["avg_dense_ms"],
-                            cache=row["avg_cache_total_ms"],
-                            warm=row["avg_warm_reconstruct_ms"],
-                            blocks=row["avg_warm_blocks"],
-                            mse=row["mean_output_mse"],
-                            ratio=row["warm_active_ratio"],
-                            cold=row["cold_spill_active"],
+                selection_policies = ["all"] if warm_read_mode == "full" else args.warm_selection_policies
+                for warm_selection_policy in selection_policies:
+                    for trial_index in range(args.trials):
+                        row = run_trial(args, mode, warm_read_mode, warm_selection_policy, seq_len, trial_index)
+                        rows.append(row)
+                        print(
+                            "mode={mode}/{warm_mode}/{policy} seq={seq} trial={trial} dense_ms={dense:.3f} cache_ms={cache:.3f} "
+                            "warm_ms={warm:.3f} warm_blocks={blocks:.1f} coverage={coverage:.2f} output_mse={mse:.6e} cold={cold}".format(
+                                mode=row["mode"],
+                                warm_mode=row["warm_read_mode"],
+                                policy=row["warm_selection_policy"],
+                                seq=row["seq_len"],
+                                trial=row["trial_index"],
+                                dense=row["avg_dense_ms"],
+                                cache=row["avg_cache_total_ms"],
+                                warm=row["avg_warm_reconstruct_ms"],
+                                blocks=row["avg_warm_blocks"],
+                                coverage=row["avg_warm_coverage_ratio"],
+                                mse=row["mean_output_mse"],
+                                cold=row["cold_spill_active"],
+                            )
                         )
-                    )
 
     write_rows(args.output, rows)
     print(f"wrote {len(rows)} rows to {args.output}")
