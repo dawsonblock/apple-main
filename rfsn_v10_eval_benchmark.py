@@ -20,6 +20,20 @@ import numpy as np
 import rfsn_v10_mlx_ane_complete as rfsn
 
 
+LLAMA32_PRESETS = {
+    "llama32-1b": {
+        "num_query_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+    },
+    "llama32-3b": {
+        "num_query_heads": 24,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+    },
+}
+
+
 CSV_FIELDS = [
     "mode",
     "warm_read_mode",
@@ -32,6 +46,9 @@ CSV_FIELDS = [
     "step_tokens",
     "num_steps",
     "query_batch",
+    "num_query_heads",
+    "num_kv_heads",
+    "kv_group_size",
     "num_heads",
     "head_dim",
     "num_subspaces",
@@ -77,11 +94,20 @@ CSV_FIELDS = [
     "dense_visible_kv_bytes",
     "dense_full_kv_bytes",
     "visible_savings_bytes",
+    "gqa_effective_peak_stored_bytes",
+    "gqa_effective_peak_warm_reconstruction_fp16_bytes",
+    "gqa_effective_peak_warm_reconstruction_fp32_bytes",
+    "gqa_effective_peak_dense_kv_fp32_bytes",
+    "gqa_effective_dense_visible_kv_bytes",
+    "gqa_effective_dense_full_kv_bytes",
+    "gqa_effective_final_stored_bytes",
+    "gqa_effective_visible_savings_bytes",
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark dense attention vs. the current RFSN hot+warm cache path")
+    parser.add_argument("--preset", choices=sorted(LLAMA32_PRESETS), help="Apply a named model-shape preset")
     parser.add_argument("--sequence-lengths", nargs="+", type=int, default=[2048, 4096])
     parser.add_argument("--modes", nargs="+", choices=["pq", "hybrid"], default=["pq", "hybrid"])
     parser.add_argument("--warm-read-modes", nargs="+", choices=["full", "blockwise"], default=["full"])
@@ -92,8 +118,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warm-block-size", type=int, default=256)
     parser.add_argument("--warm-selection-blocks", type=int, default=2)
     parser.add_argument("--query-batch", type=int, default=1)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--num-heads", type=int, help="Backward-compatible alias for --num-query-heads")
+    parser.add_argument("--num-query-heads", type=int)
+    parser.add_argument("--num-kv-heads", type=int)
+    parser.add_argument("--head-dim", type=int)
     parser.add_argument("--num-subspaces", type=int, default=8)
     parser.add_argument("--pq-bits", type=int, default=8)
     parser.add_argument("--num-rvq-layers", type=int, default=4)
@@ -104,8 +132,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cold-capacity", type=int, default=2000000)
     parser.add_argument("--skip-score-drift", action="store_true")
     parser.add_argument("--allow-cold-spill", action="store_true")
-    parser.add_argument("--output", type=Path, default=Path("rfsn_v10_benchmark_results.csv"))
+    parser.add_argument("--resume", action="store_true", help="Resume from an existing CSV output file if present")
+    parser.add_argument("--output", type=Path)
     return parser.parse_args()
+
+
+def first_non_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def apply_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    preset_values = LLAMA32_PRESETS.get(args.preset, {})
+    args.num_query_heads = int(first_non_none(args.num_query_heads, args.num_heads, preset_values.get("num_query_heads"), 4))
+    args.num_kv_heads = int(first_non_none(args.num_kv_heads, preset_values.get("num_kv_heads"), args.num_query_heads))
+    args.num_heads = args.num_query_heads
+    args.head_dim = int(first_non_none(args.head_dim, preset_values.get("head_dim"), 128))
+    if args.output is None:
+        if args.preset is None:
+            args.output = Path("rfsn_v10_benchmark_results.csv")
+        else:
+            args.output = Path(f"rfsn_v10_{args.preset}_benchmark_results.csv")
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -117,8 +167,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("warm_selection_blocks must be positive")
     if args.query_batch <= 0:
         raise ValueError("query_batch must be positive")
-    if args.num_heads <= 0 or args.head_dim <= 0:
-        raise ValueError("num_heads and head_dim must be positive")
+    if args.num_query_heads <= 0 or args.num_kv_heads <= 0 or args.head_dim <= 0:
+        raise ValueError("num_query_heads, num_kv_heads, and head_dim must be positive")
+    if args.num_query_heads % args.num_kv_heads != 0:
+        raise ValueError("num_query_heads must be divisible by num_kv_heads")
     if args.num_subspaces <= 0:
         raise ValueError("num_subspaces must be positive")
     if args.head_dim % args.num_subspaces != 0:
@@ -151,6 +203,21 @@ def sample_prefix_lengths(seq_len: int, step_tokens: int) -> List[int]:
     if not positions or positions[-1] != seq_len:
         positions.append(seq_len)
     return positions
+
+
+def kv_group_size(args: argparse.Namespace) -> int:
+    return args.num_query_heads // args.num_kv_heads
+
+
+def expand_kv_heads(kv: np.ndarray, num_query_heads: int) -> np.ndarray:
+    if kv.shape[1] == num_query_heads:
+        return kv
+    repeats = num_query_heads // kv.shape[1]
+    return np.repeat(kv, repeats, axis=1)
+
+
+def scale_gqa_bytes(measured_bytes: int, args: argparse.Namespace) -> int:
+    return int((measured_bytes * args.num_kv_heads) // args.num_query_heads)
 
 
 def build_warm_block_ranges(num_warm: int, block_size_tokens: int) -> List[tuple[int, int]]:
@@ -235,8 +302,8 @@ def build_selected_dense_keys(
 def build_config(args: argparse.Namespace, mode: str, disk_cache_dir: Path) -> rfsn.RFSNConfig:
     rvq_layers = 0 if mode == "pq" else args.num_rvq_layers
     return rfsn.RFSNConfig(
-        hidden_dim=args.num_heads * args.head_dim,
-        num_heads=args.num_heads,
+        hidden_dim=args.num_query_heads * args.head_dim,
+        num_heads=args.num_query_heads,
         head_dim=args.head_dim,
         num_layers=1,
         num_subspaces=args.num_subspaces,
@@ -270,9 +337,11 @@ def run_trial(
         quantizer = rfsn.HybridQuantizerMLX(config)
         cache = rfsn.RFSNv10KVCacheMLX(config, layer_idx=0)
 
-        keys = rng.standard_normal((seq_len, config.num_heads, config.head_dim)).astype(np.float32)
-        values = rng.standard_normal((seq_len, config.num_heads, config.head_dim)).astype(np.float32)
-        queries = rng.standard_normal((len(prefix_lengths), args.query_batch, config.num_heads, config.head_dim)).astype(np.float32)
+        kv_keys = rng.standard_normal((seq_len, args.num_kv_heads, config.head_dim)).astype(np.float32)
+        kv_values = rng.standard_normal((seq_len, args.num_kv_heads, config.head_dim)).astype(np.float32)
+        keys = expand_kv_heads(kv_keys, args.num_query_heads)
+        values = expand_kv_heads(kv_values, args.num_query_heads)
+        queries = rng.standard_normal((len(prefix_lengths), args.query_batch, args.num_query_heads, config.head_dim)).astype(np.float32)
 
         update_ms_values: List[float] = []
         dense_ms_values: List[float] = []
@@ -291,6 +360,10 @@ def run_trial(
         peak_warm_reconstruction_fp16_bytes = 0
         peak_warm_reconstruction_fp32_bytes = 0
         peak_dense_kv_fp32_bytes = 0
+        gqa_effective_peak_stored_bytes = 0
+        gqa_effective_peak_warm_reconstruction_fp16_bytes = 0
+        gqa_effective_peak_warm_reconstruction_fp32_bytes = 0
+        gqa_effective_peak_dense_kv_fp32_bytes = 0
         warm_active_steps = 0
         cold_spill_active = 0
         warm_blocks_values: List[float] = []
@@ -393,6 +466,22 @@ def run_trial(
                 peak_dense_kv_fp32_bytes,
                 int(cache_metrics["dense_kv_fp32_bytes"]),
             )
+            gqa_effective_peak_stored_bytes = max(
+                gqa_effective_peak_stored_bytes,
+                scale_gqa_bytes(int(cache_metrics["stored_bytes"]), args),
+            )
+            gqa_effective_peak_warm_reconstruction_fp16_bytes = max(
+                gqa_effective_peak_warm_reconstruction_fp16_bytes,
+                scale_gqa_bytes(int(cache_metrics["warm_reconstruction_fp16_bytes"]), args),
+            )
+            gqa_effective_peak_warm_reconstruction_fp32_bytes = max(
+                gqa_effective_peak_warm_reconstruction_fp32_bytes,
+                scale_gqa_bytes(int(cache_metrics["warm_reconstruction_fp32_bytes"]), args),
+            )
+            gqa_effective_peak_dense_kv_fp32_bytes = max(
+                gqa_effective_peak_dense_kv_fp32_bytes,
+                scale_gqa_bytes(int(cache_metrics["dense_kv_fp32_bytes"]), args),
+            )
 
         final_usage = cache.memory_usage_bytes()
         final_stored_bytes = int(
@@ -405,6 +494,9 @@ def run_trial(
         visible_tokens = cache.num_hot + cache.num_warm
         dense_visible_kv_bytes = int(visible_tokens * config.num_heads * config.head_dim * 2 * 2)
         dense_full_kv_bytes = int(seq_len * config.num_heads * config.head_dim * 2 * 2)
+        gqa_effective_dense_visible_kv_bytes = int(visible_tokens * args.num_kv_heads * config.head_dim * 2 * 2)
+        gqa_effective_dense_full_kv_bytes = int(seq_len * args.num_kv_heads * config.head_dim * 2 * 2)
+        gqa_effective_final_stored_bytes = scale_gqa_bytes(final_stored_bytes, args)
 
         return {
             "mode": mode,
@@ -418,6 +510,9 @@ def run_trial(
             "step_tokens": args.step_tokens,
             "num_steps": len(prefix_lengths),
             "query_batch": args.query_batch,
+            "num_query_heads": args.num_query_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "kv_group_size": kv_group_size(args),
             "num_heads": config.num_heads,
             "head_dim": config.head_dim,
             "num_subspaces": config.num_subspaces,
@@ -463,6 +558,14 @@ def run_trial(
             "dense_visible_kv_bytes": dense_visible_kv_bytes,
             "dense_full_kv_bytes": dense_full_kv_bytes,
             "visible_savings_bytes": dense_visible_kv_bytes - final_stored_bytes,
+            "gqa_effective_peak_stored_bytes": gqa_effective_peak_stored_bytes,
+            "gqa_effective_peak_warm_reconstruction_fp16_bytes": gqa_effective_peak_warm_reconstruction_fp16_bytes,
+            "gqa_effective_peak_warm_reconstruction_fp32_bytes": gqa_effective_peak_warm_reconstruction_fp32_bytes,
+            "gqa_effective_peak_dense_kv_fp32_bytes": gqa_effective_peak_dense_kv_fp32_bytes,
+            "gqa_effective_dense_visible_kv_bytes": gqa_effective_dense_visible_kv_bytes,
+            "gqa_effective_dense_full_kv_bytes": gqa_effective_dense_full_kv_bytes,
+            "gqa_effective_final_stored_bytes": gqa_effective_final_stored_bytes,
+            "gqa_effective_visible_savings_bytes": gqa_effective_dense_visible_kv_bytes - gqa_effective_final_stored_bytes,
         }
 
 
@@ -475,39 +578,141 @@ def write_rows(output_path: Path, rows: Sequence[Dict[str, float | int | str]]) 
             writer.writerow(row)
 
 
+def row_identity(row: Dict[str, float | int | str]) -> tuple[str, str, str, int, int, int, int, int, int, int, int]:
+    return (
+        str(row["mode"]),
+        str(row["warm_read_mode"]),
+        str(row["warm_selection_policy"]),
+        int(row["trial_index"]),
+        int(row["seed"]),
+        int(row["seq_len"]),
+        int(row["num_query_heads"]),
+        int(row["num_kv_heads"]),
+        int(row["head_dim"]),
+        int(row["warm_block_size_tokens"]),
+        int(row["warm_selection_blocks"]),
+    )
+
+
+def planned_row_identity(
+    args: argparse.Namespace,
+    mode: str,
+    warm_read_mode: str,
+    warm_selection_policy: str,
+    seq_len: int,
+    trial_index: int,
+) -> tuple[str, str, str, int, int, int, int, int, int, int, int]:
+    seed = args.seed + trial_index
+    return (
+        mode,
+        warm_read_mode,
+        warm_selection_policy,
+        trial_index,
+        seed,
+        seq_len,
+        args.num_query_heads,
+        args.num_kv_heads,
+        args.head_dim,
+        args.warm_block_size,
+        0 if warm_selection_policy == "all" else args.warm_selection_blocks,
+    )
+
+
+def load_existing_rows(output_path: Path) -> List[Dict[str, str]]:
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return []
+    with output_path.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != CSV_FIELDS:
+            raise ValueError(
+                f"Existing output file {output_path} has unexpected columns; remove it or use a different path"
+            )
+        return list(reader)
+
+
+def open_result_writer(output_path: Path, append: bool):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    handle = output_path.open(mode, newline="")
+    writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+    if not append:
+        writer.writeheader()
+        handle.flush()
+    return handle, writer
+
+
 def main() -> None:
     args = parse_args()
+    args = apply_defaults(args)
     validate_args(args)
 
-    rows: List[Dict[str, float | int | str]] = []
-    for seq_len in args.sequence_lengths:
-        for mode in args.modes:
-            for warm_read_mode in args.warm_read_modes:
-                selection_policies = ["all"] if warm_read_mode == "full" else args.warm_selection_policies
-                for warm_selection_policy in selection_policies:
-                    for trial_index in range(args.trials):
-                        row = run_trial(args, mode, warm_read_mode, warm_selection_policy, seq_len, trial_index)
-                        rows.append(row)
-                        print(
-                            "mode={mode}/{warm_mode}/{policy} seq={seq} trial={trial} dense_ms={dense:.3f} cache_ms={cache:.3f} "
-                            "warm_ms={warm:.3f} warm_blocks={blocks:.1f} coverage={coverage:.2f} output_mse={mse:.6e} cold={cold}".format(
-                                mode=row["mode"],
-                                warm_mode=row["warm_read_mode"],
-                                policy=row["warm_selection_policy"],
-                                seq=row["seq_len"],
-                                trial=row["trial_index"],
-                                dense=row["avg_dense_ms"],
-                                cache=row["avg_cache_total_ms"],
-                                warm=row["avg_warm_reconstruct_ms"],
-                                blocks=row["avg_warm_blocks"],
-                                coverage=row["avg_warm_coverage_ratio"],
-                                mse=row["mean_output_mse"],
-                                cold=row["cold_spill_active"],
-                            )
-                        )
+    existing_rows = load_existing_rows(args.output) if args.resume else []
+    completed_identities = {row_identity(row) for row in existing_rows}
+    if args.resume and existing_rows:
+        print(f"resuming {args.output} with {len(existing_rows)} existing rows")
 
-    write_rows(args.output, rows)
-    print(f"wrote {len(rows)} rows to {args.output}")
+    handle, writer = open_result_writer(args.output, append=bool(existing_rows))
+    written_rows = 0
+    skipped_rows = 0
+
+    try:
+        for seq_len in args.sequence_lengths:
+            for mode in args.modes:
+                for warm_read_mode in args.warm_read_modes:
+                    selection_policies = ["all"] if warm_read_mode == "full" else args.warm_selection_policies
+                    for warm_selection_policy in selection_policies:
+                        for trial_index in range(args.trials):
+                            identity = planned_row_identity(
+                                args,
+                                mode,
+                                warm_read_mode,
+                                warm_selection_policy,
+                                seq_len,
+                                trial_index,
+                            )
+                            if identity in completed_identities:
+                                skipped_rows += 1
+                                print(
+                                    "skip mode={mode}/{warm_mode}/{policy} seq={seq} trial={trial}".format(
+                                        mode=mode,
+                                        warm_mode=warm_read_mode,
+                                        policy=warm_selection_policy,
+                                        seq=seq_len,
+                                        trial=trial_index,
+                                    )
+                                )
+                                continue
+
+                            row = run_trial(args, mode, warm_read_mode, warm_selection_policy, seq_len, trial_index)
+                            writer.writerow(row)
+                            handle.flush()
+                            written_rows += 1
+                            completed_identities.add(row_identity(row))
+
+                            print(
+                                "mode={mode}/{warm_mode}/{policy} heads={query_heads}/{kv_heads} seq={seq} trial={trial} dense_ms={dense:.3f} cache_ms={cache:.3f} "
+                                "warm_ms={warm:.3f} warm_blocks={blocks:.1f} coverage={coverage:.2f} output_mse={mse:.6e} cold={cold}".format(
+                                    mode=row["mode"],
+                                    warm_mode=row["warm_read_mode"],
+                                    policy=row["warm_selection_policy"],
+                                    query_heads=row["num_query_heads"],
+                                    kv_heads=row["num_kv_heads"],
+                                    seq=row["seq_len"],
+                                    trial=row["trial_index"],
+                                    dense=row["avg_dense_ms"],
+                                    cache=row["avg_cache_total_ms"],
+                                    warm=row["avg_warm_reconstruct_ms"],
+                                    blocks=row["avg_warm_blocks"],
+                                    coverage=row["avg_warm_coverage_ratio"],
+                                    mse=row["mean_output_mse"],
+                                    cold=row["cold_spill_active"],
+                                )
+                            )
+    finally:
+        handle.close()
+
+    total_rows = len(existing_rows) + written_rows
+    print(f"wrote {total_rows} rows to {args.output} (new={written_rows}, skipped={skipped_rows})")
 
 
 if __name__ == "__main__":
