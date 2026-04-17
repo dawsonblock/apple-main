@@ -149,7 +149,19 @@ python3 rfsn_v10_eval_benchmark.py \
   --output /tmp/rfsn_v10_benchmark_smoke.csv
 ```
 
-### 4. Run the Llama 3.2-shaped long sweeps
+### 4. Run the structural performance checks
+
+```bash
+python3 tests/test_performance.py
+```
+
+What it verifies:
+
+- hot-tier appends no longer rely on `mx.concatenate`
+- normal blockwise attention no longer touches `_mx_to_np` / `_np_to_mx`
+- `mx.profiler` is used opportunistically when the installed MLX runtime exposes it
+
+### 5. Run the Llama 3.2-shaped long sweeps
 
 ```bash
 python3 rfsn_v10_llama32_benchmark.py llama32-1b --long-sweep
@@ -168,6 +180,7 @@ The central configuration object controls:
 - PQ shape: `num_subspaces`, `pq_bits`, `subspace_dim`
 - RVQ shape: `num_rvq_layers`, `rvq_codebook_size`, `rvq_sparsity_threshold`
 - cache capacities: `hot_capacity`, `warm_capacity`, `cold_capacity`
+- acceleration controls: `hot_cache_dtype`, `rvq_max_active`
 - blockwise decode granularity: `block_size_seq`
 - disk spill behavior: `disk_cache_dir`, `max_open_files`, `prefetch_throttle_s`
 - CPU-side behavior: `cpu_threads`
@@ -188,6 +201,12 @@ The implementation uses two stages:
 2. Residual Vector Quantization
    - encodes residuals left after PQ reconstruction
    - stores sparse correction rows and row offsets
+
+Acceleration-oriented notes:
+
+- `hot_cache_dtype` controls the storage dtype of the preallocated hot KV buffers
+- `rvq_max_active` enables a fixed-width padded RVQ path for more JIT-friendly sparse-entry handling
+- if `rvq_max_active <= 0`, the prototype preserves dynamic sparse storage behavior
    - applies corrections on decode
 
 `HybridQuantizerMLX` composes the two stages and returns:
@@ -420,6 +439,12 @@ Wrapper output naming:
 
 ```bash
 python3 rfsn_v10_mlx_ane_complete.py
+```
+
+### Run the structural performance verification script
+
+```bash
+python3 tests/test_performance.py
 ```
 
 ### Run the unified launcher
@@ -680,6 +705,8 @@ The built-in test suite currently checks:
 - There is no tokenizer, model loader, or generation loop.
 - ANE execution is not verified.
 - Benchmark results are synthetic and hardware-dependent.
+- Optional FP8 hot-cache mode depends on MLX runtime dtype support; the current local runtime may expose only `float16`/`bfloat16`.
+- `mx.profiler` is runtime-dependent; the included performance script falls back to structural checks when profiler hooks are unavailable.
 
 ## Practical next steps
 

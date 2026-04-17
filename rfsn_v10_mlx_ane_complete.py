@@ -82,6 +82,8 @@ class RFSNConfig:
     prefetch_throttle_s: float = 0.25
 
     cpu_threads: int = 4
+    hot_cache_dtype: str = "float16"
+    rvq_max_active: int = 0
 
     def __post_init__(self) -> None:
         expected_dim = self.num_subspaces * self.subspace_dim
@@ -103,6 +105,27 @@ def _require_mlx() -> None:
 def _mx_dtype(name: str):
     _require_mlx()
     return getattr(mx, name)
+
+
+def _resolve_cache_storage_dtype(name: str):
+    _require_mlx()
+    if not hasattr(mx, name):
+        raise RuntimeError(
+            f"Requested cache dtype {name!r} is not available in this MLX runtime"
+        )
+    return getattr(mx, name)
+
+
+def _dtype_nbytes(name: str) -> int:
+    if name.startswith("float8"):
+        return 1
+    if name in {"bool_", "uint8", "int8"}:
+        return 1
+    if name in {"float16", "bfloat16", "uint16", "int16"}:
+        return 2
+    if name in {"float32", "uint32", "int32"}:
+        return 4
+    raise ValueError(f"Unsupported dtype name for byte accounting: {name}")
 
 
 def _mx_to_np(x: Any, dtype: Optional[np.dtype] = None) -> np.ndarray:
@@ -127,6 +150,63 @@ def _stable_softmax_np(scores: np.ndarray, axis: int = -1) -> np.ndarray:
     denom = np.sum(exp_scores, axis=axis, keepdims=True)
     denom = np.where(denom == 0.0, 1.0, denom)
     return exp_scores / denom
+
+
+def _force_eval(*tensors) -> None:
+    _require_mlx()
+    if tensors:
+        mx.eval(*tensors)
+
+
+def _stable_softmax_mx(scores, axis: int = -1):
+    max_scores = mx.max(scores, axis=axis, keepdims=True)
+    shifted = scores - max_scores
+    exp_scores = mx.exp(shifted)
+    denom = mx.sum(exp_scores, axis=axis, keepdims=True)
+    denom = mx.where(denom == 0.0, mx.ones_like(denom), denom)
+    return exp_scores / denom
+
+
+def dense_attention_reference_mx(q, k, v):
+    if k.shape[0] == 0:
+        return mx.zeros(q.shape, dtype=_mx_dtype("float32"))
+    q_f32 = q.astype(_mx_dtype("float32"))
+    k_f32 = k.astype(_mx_dtype("float32"))
+    v_f32 = v.astype(_mx_dtype("float32"))
+    scale = k.shape[-1] ** -0.5
+    scores = mx.einsum("bhd,shd->bhs", q_f32, k_f32) * scale
+    weights = _stable_softmax_mx(scores, axis=-1)
+    return mx.einsum("bhs,shd->bhd", weights, v_f32).astype(_mx_dtype("float32"))
+
+
+def _streaming_attention_update_mx(
+    q,
+    k,
+    v,
+    running_max,
+    running_sum,
+    running_out,
+):
+    if k.shape[0] == 0:
+        return running_max, running_sum, running_out
+
+    q_f32 = q.astype(_mx_dtype("float32"))
+    k_f32 = k.astype(_mx_dtype("float32"))
+    v_f32 = v.astype(_mx_dtype("float32"))
+    scale = k.shape[-1] ** -0.5
+    scores = mx.einsum("bhd,shd->bhs", q_f32, k_f32) * scale
+    chunk_max = mx.max(scores, axis=-1)
+    new_max = mx.where(running_max > chunk_max, running_max, chunk_max)
+
+    prev_rescale = mx.exp(running_max - new_max)
+    chunk_weights = mx.exp(scores - new_max[:, :, None])
+
+    running_sum = running_sum * prev_rescale + mx.sum(chunk_weights, axis=-1)
+    running_out = (
+        running_out * prev_rescale[:, :, None]
+        + mx.einsum("bhs,shd->bhd", chunk_weights, v_f32)
+    )
+    return new_max, running_sum, running_out
 
 
 def dense_attention_reference_np(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -248,40 +328,35 @@ class ProductQuantizerMLX(nn.Module):
         self.codebooks = _np_to_mx(codebooks, dtype=_mx_dtype("float16"))
 
     def quantize(self, vectors) -> Tuple[Any, Any]:
-        vectors_np = _mx_to_np(vectors, np.float32)
-        n, d = vectors_np.shape
+        vectors_f32 = vectors.astype(_mx_dtype("float32"))
+        n, d = vectors_f32.shape
         if d != self.num_subspaces * self.subspace_dim:
             raise ValueError(f"Expected dim {self.num_subspaces * self.subspace_dim}, got {d}")
 
-        codebooks_np = _mx_to_np(self.codebooks, np.float32)
-        codes = np.zeros((n, self.num_subspaces), dtype=np.uint8)
-        reconstructed = np.zeros_like(vectors_np, dtype=np.float32)
+        vectors_sub = vectors_f32.reshape(n, self.num_subspaces, self.subspace_dim)
+        codebooks_f32 = self.codebooks.astype(_mx_dtype("float32"))
+        dists = mx.sum((vectors_sub[:, :, None, :] - codebooks_f32[None, :, :, :]) ** 2, axis=-1)
+        codes = mx.argmin(dists, axis=-1).astype(_mx_dtype("uint8"))
 
-        for sub in range(self.num_subspaces):
-            s0 = sub * self.subspace_dim
-            s1 = s0 + self.subspace_dim
-            v_sub = vectors_np[:, s0:s1]
-            cb = codebooks_np[sub]
-            dists = np.sum((v_sub[:, None, :] - cb[None, :, :]) ** 2, axis=-1)
-            idx = np.argmin(dists, axis=1).astype(np.uint8)
-            codes[:, sub] = idx
-            reconstructed[:, s0:s1] = cb[idx]
-
-        residuals = vectors_np - reconstructed
-        return _np_to_mx(codes, dtype=_mx_dtype("uint8")), _np_to_mx(residuals, dtype=vectors.dtype)
+        gathered = mx.take_along_axis(
+            codebooks_f32,
+            mx.transpose(codes.astype(_mx_dtype("int32")), (1, 0))[:, :, None],
+            axis=1,
+        )
+        reconstructed = mx.transpose(gathered, (1, 0, 2)).reshape(n, d)
+        residuals = vectors_f32 - reconstructed
+        return codes, residuals.astype(vectors.dtype)
 
     def decode(self, codes):
-        codes_np = _mx_to_np(codes, np.int32)
-        n = codes_np.shape[0]
-        out = np.zeros((n, self.num_subspaces * self.subspace_dim), dtype=np.float32)
-        codebooks_np = _mx_to_np(self.codebooks, np.float32)
-
-        for sub in range(self.num_subspaces):
-            s0 = sub * self.subspace_dim
-            s1 = s0 + self.subspace_dim
-            out[:, s0:s1] = codebooks_np[sub][codes_np[:, sub]]
-
-        return _np_to_mx(out, dtype=_mx_dtype("float16"))
+        n = codes.shape[0]
+        codebooks_f32 = self.codebooks.astype(_mx_dtype("float32"))
+        gathered = mx.take_along_axis(
+            codebooks_f32,
+            mx.transpose(codes.astype(_mx_dtype("int32")), (1, 0))[:, :, None],
+            axis=1,
+        )
+        out = mx.transpose(gathered, (1, 0, 2)).reshape(n, self.num_subspaces * self.subspace_dim)
+        return out.astype(_mx_dtype("float16"))
 
 
 class ResidualVQMLX(nn.Module):
@@ -293,6 +368,7 @@ class ResidualVQMLX(nn.Module):
         self.codebook_size = config.rvq_codebook_size
         self.head_dim = config.head_dim
         self.sparsity_threshold = config.rvq_sparsity_threshold
+        self.max_active = config.rvq_max_active
 
         scale = (2.0 / self.head_dim) ** 0.5
         codebooks = np.random.randn(
@@ -300,55 +376,66 @@ class ResidualVQMLX(nn.Module):
         ).astype(np.float32) * scale
         self.codebooks = _np_to_mx(codebooks, dtype=_mx_dtype("float16"))
 
-    def encode(self, residuals) -> Tuple[Any, Any, Any]:
-        residuals_np = _mx_to_np(residuals, np.float32)
-        norms = np.linalg.norm(residuals_np, axis=1)
-        mask = norms > self.sparsity_threshold
-        offsets = np.where(mask)[0].astype(np.int32)
+    def encode(self, residuals) -> Tuple[Any, Any, Any, Any]:
+        residuals_f32 = residuals.astype(_mx_dtype("float32"))
+        total_rows = residuals_f32.shape[0]
+        norms = mx.sqrt(mx.sum(residuals_f32 * residuals_f32, axis=1))
+        row_mask = norms > self.sparsity_threshold
+        scores = mx.where(row_mask, norms, mx.zeros_like(norms))
 
-        if offsets.size == 0:
-            empty_codes = np.zeros((0, self.num_layers), dtype=np.uint16)
-            return (
-                _np_to_mx(empty_codes, dtype=_mx_dtype("uint16")),
-                _np_to_mx(mask.astype(np.bool_), dtype=_mx_dtype("bool_")),
-                _np_to_mx(offsets, dtype=_mx_dtype("int32")),
-            )
+        if self.max_active > 0:
+            max_active = min(self.max_active, total_rows)
+            offsets = mx.argsort(-scores)[:max_active].astype(_mx_dtype("int32"))
+            entry_mask = scores[offsets] > 0.0
+        else:
+            active_count = int(np.sum(_mx_to_np(row_mask, np.int32)))
+            if active_count == 0:
+                empty_codes = mx.zeros((0, self.num_layers), dtype=_mx_dtype("uint16"))
+                empty_offsets = mx.zeros((0,), dtype=_mx_dtype("int32"))
+                empty_mask = mx.zeros((0,), dtype=_mx_dtype("bool_"))
+                return empty_codes, row_mask.astype(_mx_dtype("bool_")), empty_offsets, empty_mask
+            offsets = mx.argsort(-scores)[:active_count].astype(_mx_dtype("int32"))
+            entry_mask = mx.ones((active_count,), dtype=_mx_dtype("bool_"))
 
-        active = residuals_np[offsets].copy()
-        codebooks_np = _mx_to_np(self.codebooks, np.float32)
-        codes = np.zeros((offsets.shape[0], self.num_layers), dtype=np.uint16)
+        active = residuals_f32[offsets]
+        active = mx.where(entry_mask[:, None], active, mx.zeros_like(active))
 
+        code_layers = []
+        codebooks_f32 = self.codebooks.astype(_mx_dtype("float32"))
         for layer in range(self.num_layers):
-            cb = codebooks_np[layer]
-            dists = np.sum((active[:, None, :] - cb[None, :, :]) ** 2, axis=-1)
-            idx = np.argmin(dists, axis=1).astype(np.uint16)
-            codes[:, layer] = idx
-            active -= cb[idx.astype(np.int32)]
+            cb = codebooks_f32[layer]
+            dists = mx.sum((active[:, None, :] - cb[None, :, :]) ** 2, axis=-1)
+            indices = mx.argmin(dists, axis=1).astype(_mx_dtype("uint16"))
+            code_layers.append(indices)
+            chosen = cb[indices.astype(_mx_dtype("int32"))]
+            active = mx.where(entry_mask[:, None], active - chosen, active)
 
-        return (
-            _np_to_mx(codes, dtype=_mx_dtype("uint16")),
-            _np_to_mx(mask.astype(np.bool_), dtype=_mx_dtype("bool_")),
-            _np_to_mx(offsets, dtype=_mx_dtype("int32")),
+        codes = mx.stack(code_layers, axis=1) if code_layers else mx.zeros((offsets.shape[0], 0), dtype=_mx_dtype("uint16"))
+        safe_offsets = mx.where(entry_mask, offsets, mx.zeros_like(offsets))
+        return codes, row_mask.astype(_mx_dtype("bool_")), safe_offsets, entry_mask.astype(_mx_dtype("bool_"))
+
+    def decode_correction(self, total_rows: int, rvq_codes, rvq_offsets, rvq_entry_mask=None):
+        out = mx.zeros((total_rows, self.head_dim), dtype=_mx_dtype("float32"))
+        if rvq_codes.shape[0] == 0:
+            return out.astype(_mx_dtype("float16"))
+
+        entry_mask = (
+            mx.ones((rvq_codes.shape[0],), dtype=_mx_dtype("bool_"))
+            if rvq_entry_mask is None
+            else rvq_entry_mask.astype(_mx_dtype("bool_"))
         )
+        safe_offsets = mx.where(entry_mask, rvq_offsets.astype(_mx_dtype("int32")), mx.zeros_like(rvq_offsets.astype(_mx_dtype("int32"))))
 
-    def decode_correction(self, total_rows: int, rvq_codes, rvq_offsets):
-        codes_np = _mx_to_np(rvq_codes, np.int32)
-        offsets_np = _mx_to_np(rvq_offsets, np.int32)
-        out = np.zeros((total_rows, self.head_dim), dtype=np.float32)
-        if offsets_np.size == 0:
-            return _np_to_mx(out, dtype=_mx_dtype("float16"))
-
-        if np.any(offsets_np < 0) or np.any(offsets_np >= total_rows):
-            raise ValueError("RVQ offsets must be valid row indices")
-
-        codebooks_np = _mx_to_np(self.codebooks, np.float32)
-        for i, row_idx in enumerate(offsets_np.tolist()):
-            correction = np.zeros((self.head_dim,), dtype=np.float32)
-            for layer in range(self.num_layers):
-                correction += codebooks_np[layer, codes_np[i, layer]]
-            out[row_idx] = correction
-
-        return _np_to_mx(out, dtype=_mx_dtype("float16"))
+        codebooks_f32 = self.codebooks.astype(_mx_dtype("float32"))
+        gathered = mx.take_along_axis(
+            codebooks_f32,
+            mx.transpose(rvq_codes.astype(_mx_dtype("int32")), (1, 0))[:, :, None],
+            axis=1,
+        )
+        corrections = mx.sum(mx.transpose(gathered, (1, 0, 2)), axis=1)
+        corrections = mx.where(entry_mask[:, None], corrections, mx.zeros_like(corrections))
+        out = out.at[safe_offsets].add(corrections)
+        return out.astype(_mx_dtype("float16"))
 
 
 class HybridQuantizerMLX(nn.Module):
@@ -359,15 +446,15 @@ class HybridQuantizerMLX(nn.Module):
         self.pq = ProductQuantizerMLX(config)
         self.rvq = ResidualVQMLX(config)
 
-    def encode(self, vectors) -> Tuple[Any, Any, Any, Any]:
+    def encode(self, vectors) -> Tuple[Any, Any, Any, Any, Any]:
         pq_codes, residuals = self.pq.quantize(vectors)
-        rvq_codes, rvq_mask, rvq_offsets = self.rvq.encode(residuals)
-        return pq_codes, rvq_codes, rvq_mask, rvq_offsets
+        rvq_codes, rvq_mask, rvq_offsets, rvq_entry_mask = self.rvq.encode(residuals)
+        return pq_codes, rvq_codes, rvq_mask, rvq_offsets, rvq_entry_mask
 
-    def decode(self, pq_codes, rvq_codes, rvq_mask, rvq_offsets):
+    def decode(self, pq_codes, rvq_codes, rvq_mask, rvq_offsets, rvq_entry_mask=None):
         del rvq_mask
         pq_recon = self.pq.decode(pq_codes).astype(_mx_dtype("float32"))
-        correction = self.rvq.decode_correction(pq_codes.shape[0], rvq_codes, rvq_offsets).astype(_mx_dtype("float32"))
+        correction = self.rvq.decode_correction(pq_codes.shape[0], rvq_codes, rvq_offsets, rvq_entry_mask).astype(_mx_dtype("float32"))
         return (pq_recon + correction).astype(_mx_dtype("float16"))
 
 
@@ -380,11 +467,8 @@ class RFSNHybridAttentionMLX(nn.Module):
         self.config = config
 
     def __call__(self, q, keys, values):
-        q_np = _mx_to_np(q, np.float32)
-        k_np = _mx_to_np(keys, np.float32)
-        v_np = _mx_to_np(values, np.float32)
-        out = dense_attention_reference_np(q_np, k_np, v_np)
-        return _np_to_mx(out, dtype=_mx_dtype("float16"))
+        out = dense_attention_reference_mx(q, keys, values)
+        return out.astype(_mx_dtype("float16"))
 
 
 class RFSNv10KVCacheMLX:
@@ -394,19 +478,23 @@ class RFSNv10KVCacheMLX:
         self.layer_idx = layer_idx
         self.hot_capacity = config.hot_capacity
         self.warm_capacity = config.warm_capacity
+        self.hot_cache_dtype_name = config.hot_cache_dtype
+        self.hot_cache_dtype = _resolve_cache_storage_dtype(self.hot_cache_dtype_name)
 
-        self.hot_keys = mx.zeros((0, config.num_heads, config.head_dim), dtype=_mx_dtype("float16"))
-        self.hot_values = mx.zeros((0, config.num_heads, config.head_dim), dtype=_mx_dtype("float16"))
+        self.hot_keys = mx.zeros((self.hot_capacity, config.num_heads, config.head_dim), dtype=self.hot_cache_dtype)
+        self.hot_values = mx.zeros((self.hot_capacity, config.num_heads, config.head_dim), dtype=self.hot_cache_dtype)
 
         self.warm_key_pq_codes = mx.zeros((0, config.num_heads, config.num_subspaces), dtype=_mx_dtype("uint8"))
         self.warm_key_rvq_codes = mx.zeros((0, config.num_rvq_layers), dtype=_mx_dtype("uint16"))
         self.warm_key_rvq_mask = mx.zeros((0, config.num_heads), dtype=_mx_dtype("bool_"))
         self.warm_key_rvq_offsets = mx.zeros((0,), dtype=_mx_dtype("int32"))
+        self.warm_key_rvq_entry_mask = mx.zeros((0,), dtype=_mx_dtype("bool_"))
 
         self.warm_value_pq_codes = mx.zeros((0, config.num_heads, config.num_subspaces), dtype=_mx_dtype("uint8"))
         self.warm_value_rvq_codes = mx.zeros((0, config.num_rvq_layers), dtype=_mx_dtype("uint16"))
         self.warm_value_rvq_mask = mx.zeros((0, config.num_heads), dtype=_mx_dtype("bool_"))
         self.warm_value_rvq_offsets = mx.zeros((0,), dtype=_mx_dtype("int32"))
+        self.warm_value_rvq_entry_mask = mx.zeros((0,), dtype=_mx_dtype("bool_"))
 
         self.cold_chunk_paths: List[Path] = []
         self.num_hot = 0
@@ -423,6 +511,13 @@ class RFSNv10KVCacheMLX:
             return "warm"
         return "cold"
 
+    def _write_hot_rows(self, buffer, start: int, values):
+        if values.shape[0] == 0:
+            return buffer
+        indices = mx.arange(start, start + values.shape[0], dtype=_mx_dtype("int32"))
+        cast_values = values.astype(buffer.dtype)
+        return buffer.at[indices].add(cast_values - buffer[indices])
+
     def update(self, new_keys, new_values, quantizer: HybridQuantizerMLX, disk_dir: Optional[Path] = None) -> None:
         if new_keys.shape != new_values.shape:
             raise ValueError("Keys and values must have identical shapes")
@@ -433,8 +528,10 @@ class RFSNv10KVCacheMLX:
         hot_space = max(0, self.hot_capacity - self.num_hot)
         hot_take = min(total - start, hot_space)
         if hot_take > 0:
-            self.hot_keys = mx.concatenate([self.hot_keys, new_keys[start:start + hot_take]], axis=0)
-            self.hot_values = mx.concatenate([self.hot_values, new_values[start:start + hot_take]], axis=0)
+            hot_keys = new_keys[start:start + hot_take]
+            hot_values = new_values[start:start + hot_take]
+            self.hot_keys = self._write_hot_rows(self.hot_keys, self.num_hot, hot_keys)
+            self.hot_values = self._write_hot_rows(self.hot_values, self.num_hot, hot_values)
             self.num_hot += hot_take
             start += hot_take
 
@@ -449,31 +546,33 @@ class RFSNv10KVCacheMLX:
 
         self.total_tokens = self.num_hot + self.num_warm + self.num_cold
 
-    def _encode_warm_batch(self, batch, quantizer: HybridQuantizerMLX, base_token_offset: int) -> Tuple[Any, Any, Any, Any]:
+    def _encode_warm_batch(self, batch, quantizer: HybridQuantizerMLX, base_token_offset: int) -> Tuple[Any, Any, Any, Any, Any]:
         s, h, d = batch.shape
         flat = batch.reshape(s * h, d)
-        pq_codes, rvq_codes, rvq_mask, rvq_offsets = quantizer.encode(flat)
+        pq_codes, rvq_codes, rvq_mask, rvq_offsets, rvq_entry_mask = quantizer.encode(flat)
         pq_codes_reshaped = pq_codes.reshape(s, h, self.config.num_subspaces)
         rvq_mask_reshaped = rvq_mask.reshape(s, h)
         shifted_offsets = rvq_offsets + int(base_token_offset * h)
-        return pq_codes_reshaped, rvq_codes, rvq_mask_reshaped, shifted_offsets
+        return pq_codes_reshaped, rvq_codes, rvq_mask_reshaped, shifted_offsets, rvq_entry_mask
 
     def _add_to_warm(self, keys, values, quantizer: HybridQuantizerMLX) -> None:
         s = keys.shape[0]
         base_offset = self.num_warm
 
-        key_pq, key_rvq, key_mask, key_offsets = self._encode_warm_batch(keys, quantizer, base_offset)
-        value_pq, value_rvq, value_mask, value_offsets = self._encode_warm_batch(values, quantizer, base_offset)
+        key_pq, key_rvq, key_mask, key_offsets, key_entry_mask = self._encode_warm_batch(keys, quantizer, base_offset)
+        value_pq, value_rvq, value_mask, value_offsets, value_entry_mask = self._encode_warm_batch(values, quantizer, base_offset)
 
         self.warm_key_pq_codes = mx.concatenate([self.warm_key_pq_codes, key_pq], axis=0)
         self.warm_key_rvq_codes = mx.concatenate([self.warm_key_rvq_codes, key_rvq], axis=0)
         self.warm_key_rvq_mask = mx.concatenate([self.warm_key_rvq_mask, key_mask], axis=0)
         self.warm_key_rvq_offsets = mx.concatenate([self.warm_key_rvq_offsets, key_offsets], axis=0)
+        self.warm_key_rvq_entry_mask = mx.concatenate([self.warm_key_rvq_entry_mask, key_entry_mask], axis=0)
 
         self.warm_value_pq_codes = mx.concatenate([self.warm_value_pq_codes, value_pq], axis=0)
         self.warm_value_rvq_codes = mx.concatenate([self.warm_value_rvq_codes, value_rvq], axis=0)
         self.warm_value_rvq_mask = mx.concatenate([self.warm_value_rvq_mask, value_mask], axis=0)
         self.warm_value_rvq_offsets = mx.concatenate([self.warm_value_rvq_offsets, value_offsets], axis=0)
+        self.warm_value_rvq_entry_mask = mx.concatenate([self.warm_value_rvq_entry_mask, value_entry_mask], axis=0)
 
         self.num_warm += s
 
@@ -485,8 +584,8 @@ class RFSNv10KVCacheMLX:
         key_flat = keys.reshape(s * h, d)
         value_flat = values.reshape(s * h, d)
 
-        key_pq, key_rvq, key_mask, key_offsets = quantizer.encode(key_flat)
-        value_pq, value_rvq, value_mask, value_offsets = quantizer.encode(value_flat)
+        key_pq, key_rvq, key_mask, key_offsets, key_entry_mask = quantizer.encode(key_flat)
+        value_pq, value_rvq, value_mask, value_offsets, value_entry_mask = quantizer.encode(value_flat)
 
         chunk_id = len(self.cold_chunk_paths)
         chunk_path = disk_dir / f"layer{self.layer_idx}_chunk{chunk_id}.npz"
@@ -499,10 +598,12 @@ class RFSNv10KVCacheMLX:
             key_rvq_codes=_mx_to_np(key_rvq, np.uint16),
             key_rvq_mask=_mx_to_np(key_mask, np.bool_),
             key_rvq_offsets=_mx_to_np(key_offsets, np.int32),
+            key_rvq_entry_mask=_mx_to_np(key_entry_mask, np.bool_),
             value_pq_codes=_mx_to_np(value_pq, np.uint8),
             value_rvq_codes=_mx_to_np(value_rvq, np.uint16),
             value_rvq_mask=_mx_to_np(value_mask, np.bool_),
             value_rvq_offsets=_mx_to_np(value_offsets, np.int32),
+            value_rvq_entry_mask=_mx_to_np(value_entry_mask, np.bool_),
         )
         self.cold_chunk_paths.append(chunk_path)
         self.num_cold += s
@@ -602,7 +703,13 @@ class RFSNv10KVCacheMLX:
             return mx.zeros((0, self.config.num_heads, self.config.head_dim), dtype=_mx_dtype("float16"))
         flat_codes = self.warm_key_pq_codes.reshape(self.num_warm * self.config.num_heads, self.config.num_subspaces)
         flat_mask = self.warm_key_rvq_mask.reshape(self.num_warm * self.config.num_heads)
-        recon = quantizer.decode(flat_codes, self.warm_key_rvq_codes, flat_mask, self.warm_key_rvq_offsets)
+        recon = quantizer.decode(
+            flat_codes,
+            self.warm_key_rvq_codes,
+            flat_mask,
+            self.warm_key_rvq_offsets,
+            self.warm_key_rvq_entry_mask,
+        )
         return recon.reshape(self.num_warm, self.config.num_heads, self.config.head_dim)
 
     def reconstruct_warm_values(self, quantizer: HybridQuantizerMLX):
@@ -610,7 +717,13 @@ class RFSNv10KVCacheMLX:
             return mx.zeros((0, self.config.num_heads, self.config.head_dim), dtype=_mx_dtype("float16"))
         flat_codes = self.warm_value_pq_codes.reshape(self.num_warm * self.config.num_heads, self.config.num_subspaces)
         flat_mask = self.warm_value_rvq_mask.reshape(self.num_warm * self.config.num_heads)
-        recon = quantizer.decode(flat_codes, self.warm_value_rvq_codes, flat_mask, self.warm_value_rvq_offsets)
+        recon = quantizer.decode(
+            flat_codes,
+            self.warm_value_rvq_codes,
+            flat_mask,
+            self.warm_value_rvq_offsets,
+            self.warm_value_rvq_entry_mask,
+        )
         return recon.reshape(self.num_warm, self.config.num_heads, self.config.head_dim)
 
     def _reconstruct_warm_component_block(
@@ -619,6 +732,7 @@ class RFSNv10KVCacheMLX:
         rvq_codes,
         rvq_mask,
         rvq_offsets,
+        rvq_entry_mask,
         quantizer: HybridQuantizerMLX,
         start_token: int,
         end_token: int,
@@ -634,20 +748,14 @@ class RFSNv10KVCacheMLX:
         row_end = end_token * self.config.num_heads
         block_pq_codes = pq_codes[start_token:end_token].reshape(token_count * self.config.num_heads, self.config.num_subspaces)
         block_mask = rvq_mask[start_token:end_token].reshape(token_count * self.config.num_heads)
-
-        offsets_np = _mx_to_np(rvq_offsets, np.int32)
-        selected = (offsets_np >= row_start) & (offsets_np < row_end)
-        local_offsets = offsets_np[selected] - row_start
-        if np.any(local_offsets < 0) or np.any(local_offsets >= token_count * self.config.num_heads):
-            raise ValueError("Local RVQ offsets must map inside the reconstructed warm block")
-
-        rvq_codes_np = _mx_to_np(rvq_codes, np.uint16)
-        local_rvq_codes = rvq_codes_np[selected]
+        local_entry_mask = rvq_entry_mask & (rvq_offsets >= row_start) & (rvq_offsets < row_end)
+        local_offsets = mx.where(local_entry_mask, rvq_offsets - row_start, mx.zeros_like(rvq_offsets))
         decoded = quantizer.decode(
             block_pq_codes,
-            _np_to_mx(local_rvq_codes, dtype=_mx_dtype("uint16")),
+            rvq_codes,
             block_mask,
-            _np_to_mx(local_offsets, dtype=_mx_dtype("int32")),
+            local_offsets.astype(_mx_dtype("int32")),
+            local_entry_mask,
         )
         return decoded.reshape(token_count, self.config.num_heads, self.config.head_dim)
 
@@ -657,6 +765,7 @@ class RFSNv10KVCacheMLX:
             self.warm_key_rvq_codes,
             self.warm_key_rvq_mask,
             self.warm_key_rvq_offsets,
+            self.warm_key_rvq_entry_mask,
             quantizer,
             start_token,
             end_token,
@@ -668,6 +777,7 @@ class RFSNv10KVCacheMLX:
             self.warm_value_rvq_codes,
             self.warm_value_rvq_mask,
             self.warm_value_rvq_offsets,
+            self.warm_value_rvq_entry_mask,
             quantizer,
             start_token,
             end_token,
@@ -690,9 +800,7 @@ class RFSNv10KVCacheMLX:
             raise ValueError("warm_block_size_tokens must be positive")
         self._validate_warm_block_token_ranges(warm_block_token_ranges)
 
-        key_parts: List[np.ndarray] = []
-        value_parts: List[np.ndarray] = []
-        q_np = _mx_to_np(q, np.float32)
+        q_mx = q.astype(_mx_dtype("float32"))
         metrics: Dict[str, float | int | str] = {}
 
         if collect_metrics:
@@ -700,7 +808,7 @@ class RFSNv10KVCacheMLX:
             metrics = {
                 "warm_read_mode": warm_read_mode,
                 "warm_block_size_tokens": int(block_size_tokens),
-                "query_batch": int(q_np.shape[0]),
+            "query_batch": int(q_mx.shape[0]),
                 "hot_tokens": int(self.num_hot),
                 "warm_tokens": int(self.num_warm),
                 "cold_tokens": int(self.num_cold),
@@ -716,7 +824,7 @@ class RFSNv10KVCacheMLX:
                 "warm_reconstruction_fp16_bytes": 0,
                 "warm_reconstruction_fp32_bytes": 0,
                 "dense_kv_fp32_bytes": 0,
-                "query_fp32_bytes": int(q_np.nbytes),
+                "query_fp32_bytes": int(np.prod(q_mx.shape) * 4),
                 "stored_bytes": int(
                     stored["hot_bytes"]
                     + stored["warm_key_pq_bytes"]
@@ -727,36 +835,38 @@ class RFSNv10KVCacheMLX:
             }
             total_start = time.perf_counter()
 
-        hot_keys_np: Optional[np.ndarray] = None
-        hot_values_np: Optional[np.ndarray] = None
+        hot_keys_mx = None
+        hot_values_mx = None
 
         if self.num_hot > 0:
-            hot_keys_np = _mx_to_np(self.hot_keys, np.float32)
-            hot_values_np = _mx_to_np(self.hot_values, np.float32)
-
-            if warm_read_mode == "full":
-                key_parts.append(hot_keys_np)
-                value_parts.append(hot_values_np)
+            hot_keys_mx = self.hot_keys[:self.num_hot].astype(_mx_dtype("float32"))
+            hot_values_mx = self.hot_values[:self.num_hot].astype(_mx_dtype("float32"))
 
         if warm_read_mode == "full":
+            key_parts = []
+            value_parts = []
+            if hot_keys_mx is not None and hot_values_mx is not None:
+                key_parts.append(hot_keys_mx)
+                value_parts.append(hot_values_mx)
+
             if self.num_warm > 0:
                 if collect_metrics:
                     reconstruct_start = time.perf_counter()
 
-                warm_keys = self.reconstruct_warm_keys(quantizer)
-                warm_values = self.reconstruct_warm_values(quantizer)
-                warm_keys_np = _mx_to_np(warm_keys, np.float32)
-                warm_values_np = _mx_to_np(warm_values, np.float32)
+                warm_keys = self.reconstruct_warm_keys(quantizer).astype(_mx_dtype("float32"))
+                warm_values = self.reconstruct_warm_values(quantizer).astype(_mx_dtype("float32"))
+                if collect_metrics:
+                    _force_eval(warm_keys, warm_values)
 
-                key_parts.append(warm_keys_np)
-                value_parts.append(warm_values_np)
+                key_parts.append(warm_keys)
+                value_parts.append(warm_values)
 
                 if collect_metrics:
                     metrics["warm_reconstruct_ms"] = (time.perf_counter() - reconstruct_start) * 1000.0
                     metrics["warm_blocks"] = int(self.num_warm > 0)
                     metrics["warm_decode_tokens"] = int(self.num_warm)
                     metrics["warm_reconstruction_fp16_bytes"] = int(self.num_warm * self.config.num_heads * self.config.head_dim * 2 * 2)
-                    metrics["warm_reconstruction_fp32_bytes"] = int(warm_keys_np.nbytes + warm_values_np.nbytes)
+                    metrics["warm_reconstruction_fp32_bytes"] = int(self.num_warm * self.config.num_heads * self.config.head_dim * 4 * 2)
 
             if not key_parts:
                 out = mx.zeros(q.shape, dtype=_mx_dtype("float16"))
@@ -767,20 +877,22 @@ class RFSNv10KVCacheMLX:
             if collect_metrics:
                 concat_start = time.perf_counter()
 
-            all_keys = np.concatenate(key_parts, axis=0)
-            all_values = np.concatenate(value_parts, axis=0)
+            all_keys = key_parts[0] if len(key_parts) == 1 else mx.concatenate(key_parts, axis=0)
+            all_values = value_parts[0] if len(value_parts) == 1 else mx.concatenate(value_parts, axis=0)
             if collect_metrics:
+                _force_eval(all_keys, all_values)
                 metrics["concat_ms"] = (time.perf_counter() - concat_start) * 1000.0
-                metrics["dense_kv_fp32_bytes"] = int(all_keys.nbytes + all_values.nbytes)
+                metrics["dense_kv_fp32_bytes"] = int(all_keys.shape[0] * self.config.num_heads * self.config.head_dim * 4 * 2)
                 attention_start = time.perf_counter()
 
-            out = dense_attention_reference_np(q_np, all_keys, all_values)
+            out = dense_attention_reference_mx(q_mx, all_keys, all_values)
 
             if collect_metrics:
+                _force_eval(out)
                 metrics["attention_ms"] = (time.perf_counter() - attention_start) * 1000.0
                 metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
 
-            return _np_to_mx(out, dtype=_mx_dtype("float16")), metrics
+            return out.astype(_mx_dtype("float16")), metrics
 
         if self.num_hot == 0 and self.num_warm == 0:
             out = mx.zeros(q.shape, dtype=_mx_dtype("float16"))
@@ -788,25 +900,26 @@ class RFSNv10KVCacheMLX:
                 metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
             return out, metrics
 
-        running_max = np.full((q_np.shape[0], q_np.shape[1]), -np.inf, dtype=np.float32)
-        running_sum = np.zeros((q_np.shape[0], q_np.shape[1]), dtype=np.float32)
-        running_out = np.zeros((q_np.shape[0], q_np.shape[1], q_np.shape[2]), dtype=np.float32)
+        running_max = mx.full((q_mx.shape[0], q_mx.shape[1]), -float("inf"), dtype=_mx_dtype("float32"))
+        running_sum = mx.zeros((q_mx.shape[0], q_mx.shape[1]), dtype=_mx_dtype("float32"))
+        running_out = mx.zeros(q_mx.shape, dtype=_mx_dtype("float32"))
 
         hot_fp32_bytes = 0
-        if hot_keys_np is not None and hot_values_np is not None:
-            hot_fp32_bytes = int(hot_keys_np.nbytes + hot_values_np.nbytes)
+        if hot_keys_mx is not None and hot_values_mx is not None:
+            hot_fp32_bytes = int(self.num_hot * self.config.num_heads * self.config.head_dim * 4 * 2)
             if collect_metrics:
                 metrics["dense_kv_fp32_bytes"] = hot_fp32_bytes
                 attention_start = time.perf_counter()
-            running_max, running_sum, running_out = _streaming_attention_update_np(
-                q_np,
-                hot_keys_np,
-                hot_values_np,
+            running_max, running_sum, running_out = _streaming_attention_update_mx(
+                q_mx,
+                hot_keys_mx,
+                hot_values_mx,
                 running_max,
                 running_sum,
                 running_out,
             )
             if collect_metrics:
+                _force_eval(running_max, running_sum, running_out)
                 metrics["attention_ms"] = float(metrics["attention_ms"]) + (time.perf_counter() - attention_start) * 1000.0
 
         warm_ranges = (
@@ -814,7 +927,6 @@ class RFSNv10KVCacheMLX:
             if warm_block_token_ranges is None
             else list(warm_block_token_ranges)
         )
-        numpy_decode_state = self._build_blockwise_numpy_decode_state(quantizer) if warm_ranges else None
 
         for start_token, end_token in warm_ranges:
             token_count = end_token - start_token
@@ -822,20 +934,19 @@ class RFSNv10KVCacheMLX:
             if collect_metrics:
                 reconstruct_start = time.perf_counter()
 
-            warm_keys_np = self._reconstruct_warm_component_block_numpy(
-                numpy_decode_state["key"],
-                numpy_decode_state,
+            warm_keys = self.reconstruct_warm_key_block(
+                quantizer,
                 start_token,
                 end_token,
-            )
-            warm_values_np = self._reconstruct_warm_component_block_numpy(
-                numpy_decode_state["value"],
-                numpy_decode_state,
+            ).astype(_mx_dtype("float32"))
+            warm_values = self.reconstruct_warm_value_block(
+                quantizer,
                 start_token,
                 end_token,
-            )
+            ).astype(_mx_dtype("float32"))
 
             if collect_metrics:
+                _force_eval(warm_keys, warm_values)
                 metrics["warm_reconstruct_ms"] = float(metrics["warm_reconstruct_ms"]) + (time.perf_counter() - reconstruct_start) * 1000.0
                 metrics["warm_blocks"] = int(metrics["warm_blocks"]) + 1
                 metrics["warm_decode_tokens"] = int(metrics["warm_decode_tokens"]) + token_count
@@ -843,7 +954,7 @@ class RFSNv10KVCacheMLX:
                     int(metrics["warm_reconstruction_fp16_bytes"]),
                     token_count * self.config.num_heads * self.config.head_dim * 2 * 2,
                 )
-                block_fp32_bytes = int(warm_keys_np.nbytes + warm_values_np.nbytes)
+                block_fp32_bytes = int(token_count * self.config.num_heads * self.config.head_dim * 4 * 2)
                 metrics["warm_reconstruction_fp32_bytes"] = max(
                     int(metrics["warm_reconstruction_fp32_bytes"]),
                     block_fp32_bytes,
@@ -854,25 +965,27 @@ class RFSNv10KVCacheMLX:
                 )
                 attention_start = time.perf_counter()
 
-            running_max, running_sum, running_out = _streaming_attention_update_np(
-                q_np,
-                warm_keys_np,
-                warm_values_np,
+            running_max, running_sum, running_out = _streaming_attention_update_mx(
+                q_mx,
+                warm_keys,
+                warm_values,
                 running_max,
                 running_sum,
                 running_out,
             )
 
             if collect_metrics:
+                _force_eval(running_max, running_sum, running_out)
                 metrics["attention_ms"] = float(metrics["attention_ms"]) + (time.perf_counter() - attention_start) * 1000.0
 
-        denom = np.where(running_sum == 0.0, 1.0, running_sum)
-        out = (running_out / denom[:, :, None]).astype(np.float32)
+        denom = mx.where(running_sum == 0.0, mx.ones_like(running_sum), running_sum)
+        out = (running_out / denom[:, :, None]).astype(_mx_dtype("float32"))
 
         if collect_metrics:
+            _force_eval(out)
             metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
 
-        return _np_to_mx(out, dtype=_mx_dtype("float16")), metrics
+        return out.astype(_mx_dtype("float16")), metrics
 
     def attention_forward(
         self,
@@ -913,7 +1026,7 @@ class RFSNv10KVCacheMLX:
         warm_key_rvq_rows = int(self.warm_key_rvq_codes.shape[0])
         warm_value_rvq_rows = int(self.warm_value_rvq_codes.shape[0])
         return {
-            "hot_bytes": self.num_hot * self.config.num_heads * self.config.head_dim * 2 * 2,
+            "hot_bytes": self.num_hot * self.config.num_heads * self.config.head_dim * _dtype_nbytes(self.hot_cache_dtype_name) * 2,
             "warm_key_pq_bytes": self.num_warm * self.config.num_heads * self.config.num_subspaces,
             "warm_value_pq_bytes": self.num_warm * self.config.num_heads * self.config.num_subspaces,
             "warm_key_rvq_bytes": warm_key_rvq_rows * self.config.num_rvq_layers * 2,
@@ -1062,15 +1175,16 @@ def run_tests() -> bool:
     assert np.isfinite(pq_mse)
 
     logger.info("[2] RVQ offsets are valid row indices")
-    rvq_codes, rvq_mask, rvq_offsets = quantizer.rvq.encode(residuals)
+    rvq_codes, rvq_mask, rvq_offsets, rvq_entry_mask = quantizer.rvq.encode(residuals)
     offsets_np = _mx_to_np(rvq_offsets, np.int32)
     assert offsets_np.ndim == 1
     assert np.all(offsets_np >= 0)
     assert np.all(offsets_np < vectors.shape[0])
     assert rvq_codes.shape[1] == config.num_rvq_layers if rvq_codes.shape[0] > 0 else True
+    assert rvq_entry_mask.shape[0] == rvq_codes.shape[0]
 
     logger.info("[3] Hybrid reconstruction improves or matches PQ-only")
-    hybrid_recon = quantizer.decode(pq_codes, rvq_codes, rvq_mask, rvq_offsets)
+    hybrid_recon = quantizer.decode(pq_codes, rvq_codes, rvq_mask, rvq_offsets, rvq_entry_mask)
     hybrid_mse = float(np.mean((_mx_to_np(vectors, np.float32) - _mx_to_np(hybrid_recon, np.float32)) ** 2))
     assert hybrid_mse <= pq_mse + 1e-6
 
@@ -1092,6 +1206,10 @@ def run_tests() -> bool:
     hot_keys = np.random.randn(4, config.num_heads, config.head_dim).astype(np.float32)
     hot_values = np.random.randn(4, config.num_heads, config.head_dim).astype(np.float32)
     cache.update(_np_to_mx(hot_keys, dtype=_mx_dtype("float16")), _np_to_mx(hot_values, dtype=_mx_dtype("float16")), quantizer)
+    assert cache.hot_keys.shape == (config.hot_capacity, config.num_heads, config.head_dim)
+    assert cache.hot_values.shape == (config.hot_capacity, config.num_heads, config.head_dim)
+    _assert_close("preallocated_hot_keys", _mx_to_np(cache.hot_keys[:cache.num_hot], np.float32), hot_keys, atol=2e-3, rtol=2e-3)
+    _assert_close("preallocated_hot_values", _mx_to_np(cache.hot_values[:cache.num_hot], np.float32), hot_values, atol=2e-3, rtol=2e-3)
 
     warm_keys = np.random.randn(5, config.num_heads, config.head_dim).astype(np.float32)
     warm_values = np.random.randn(5, config.num_heads, config.head_dim).astype(np.float32)
@@ -1101,6 +1219,8 @@ def run_tests() -> bool:
     assert cache.warm_value_pq_codes.shape[0] == cache.num_warm
     assert cache.warm_key_rvq_mask.shape == (cache.num_warm, config.num_heads)
     assert cache.warm_value_rvq_mask.shape == (cache.num_warm, config.num_heads)
+    assert cache.warm_key_rvq_entry_mask.shape[0] == cache.warm_key_rvq_codes.shape[0]
+    assert cache.warm_value_rvq_entry_mask.shape[0] == cache.warm_value_rvq_codes.shape[0]
 
     logger.info("[6] Warm reconstruction returns coherent K/V tensors")
     warm_k_recon = _mx_to_np(cache.reconstruct_warm_keys(quantizer), np.float32)
@@ -1269,10 +1389,12 @@ def run_tests() -> bool:
             "key_rvq_codes",
             "key_rvq_mask",
             "key_rvq_offsets",
+            "key_rvq_entry_mask",
             "value_pq_codes",
             "value_rvq_codes",
             "value_rvq_mask",
             "value_rvq_offsets",
+            "value_rvq_entry_mask",
         }
         assert expected.issubset(set(chunk.keys()))
 
