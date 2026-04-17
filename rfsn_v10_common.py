@@ -6,6 +6,7 @@ import os
 from typing import Any, Optional
 
 import numpy as np
+from numpy.typing import DTypeLike
 
 _MLX_IMPORT_ERROR: Exception | None = None
 
@@ -103,7 +104,7 @@ def _dtype_nbytes(name: str) -> int:
     raise ValueError(f"Unsupported dtype name for byte accounting: {name}")
 
 
-def _mx_to_np(x: Any, dtype: Optional[np.dtype] = None) -> np.ndarray:
+def _mx_to_np(x: Any, dtype: DTypeLike | None = None) -> np.ndarray:
     arr = np.array(x)
     if dtype is not None:
         arr = arr.astype(dtype, copy=False)
