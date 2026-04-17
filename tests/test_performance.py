@@ -9,6 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import rfsn_v10_common as common
 import rfsn_v10_mlx_ane_complete as rfsn
 
 
@@ -82,8 +83,8 @@ def verify_no_host_copies_in_attention() -> None:
     query = np.random.randn(2, config.num_heads, config.head_dim).astype(np.float32)
     query_mx = rfsn._np_to_mx(query, dtype=rfsn._mx_dtype("float16"))
 
-    original_mx_to_np = rfsn._mx_to_np
-    original_np_to_mx = rfsn._np_to_mx
+    original_mx_to_np = common._mx_to_np
+    original_np_to_mx = common._np_to_mx
     mx_to_np_calls = 0
     np_to_mx_calls = 0
 
@@ -97,8 +98,8 @@ def verify_no_host_copies_in_attention() -> None:
         np_to_mx_calls += 1
         return original_np_to_mx(*args, **kwargs)
 
-    rfsn._mx_to_np = tracked_mx_to_np
-    rfsn._np_to_mx = tracked_np_to_mx
+    common._mx_to_np = tracked_mx_to_np
+    common._np_to_mx = tracked_np_to_mx
     try:
         output = cache.attention_forward(
             query_mx,
@@ -108,8 +109,8 @@ def verify_no_host_copies_in_attention() -> None:
         )
         rfsn._force_eval(output)
     finally:
-        rfsn._mx_to_np = original_mx_to_np
-        rfsn._np_to_mx = original_np_to_mx
+        common._mx_to_np = original_mx_to_np
+        common._np_to_mx = original_np_to_mx
 
     assert mx_to_np_calls == 0, f"attention_forward touched host via _mx_to_np {mx_to_np_calls} time(s)"
     assert np_to_mx_calls == 0, f"attention_forward rebuilt device tensors via _np_to_mx {np_to_mx_calls} time(s)"

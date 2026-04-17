@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 PRESETS = ("llama32-1b", "llama32-3b")
+RVQ_LAYOUT_CHOICES = ("fixed-default", "dynamic", "capped")
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-tokens", type=int, default=512)
     parser.add_argument("--warm-block-size", type=int, default=512)
     parser.add_argument("--warm-selection-blocks", type=int, default=2)
+    parser.add_argument("--rvq-layouts", nargs="+", choices=RVQ_LAYOUT_CHOICES, default=["fixed-default"])
+    parser.add_argument("--rvq-max-active", type=int)
     parser.add_argument("--hot-capacity", type=int, default=1024)
     parser.add_argument("--warm-capacity", type=int, default=16384)
     parser.add_argument("--cold-capacity", type=int, default=2000000)
@@ -66,6 +69,8 @@ def build_command(args: argparse.Namespace, preset: str) -> list[str]:
         "--warm-selection-policies",
         "all",
         "recent",
+        "--rvq-layouts",
+        *args.rvq_layouts,
         "--trials",
         str(args.trials),
         "--seed",
@@ -85,6 +90,8 @@ def build_command(args: argparse.Namespace, preset: str) -> list[str]:
         "--output",
         str(output_path(args, preset)),
     ]
+    if args.rvq_max_active is not None:
+        cmd.extend(["--rvq-max-active", str(args.rvq_max_active)])
     if args.allow_cold_spill:
         cmd.append("--allow-cold-spill")
     if not args.no_resume:

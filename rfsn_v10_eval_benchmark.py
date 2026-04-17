@@ -13,11 +13,22 @@ import csv
 from pathlib import Path
 import tempfile
 import time
-from typing import Dict, List, Sequence
+from typing import Dict, List, Mapping, Sequence
 
 import numpy as np
 
 import rfsn_v10_mlx_ane_complete as rfsn
+
+
+RVQ_LAYOUT_FIXED_DEFAULT = "fixed-default"
+RVQ_LAYOUT_DYNAMIC = "dynamic"
+RVQ_LAYOUT_CAPPED = "capped"
+RVQ_LAYOUT_DISABLED = "disabled"
+RVQ_LAYOUT_CHOICES = [
+    RVQ_LAYOUT_FIXED_DEFAULT,
+    RVQ_LAYOUT_DYNAMIC,
+    RVQ_LAYOUT_CAPPED,
+]
 
 
 LLAMA32_PRESETS = {
@@ -54,6 +65,8 @@ CSV_FIELDS = [
     "num_subspaces",
     "pq_bits",
     "num_rvq_layers",
+    "rvq_layout",
+    "rvq_max_active",
     "hot_capacity",
     "warm_capacity",
     "cold_capacity",
@@ -125,6 +138,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-subspaces", type=int, default=8)
     parser.add_argument("--pq-bits", type=int, default=8)
     parser.add_argument("--num-rvq-layers", type=int, default=4)
+    parser.add_argument("--rvq-layouts", nargs="+", choices=RVQ_LAYOUT_CHOICES, default=[RVQ_LAYOUT_FIXED_DEFAULT])
+    parser.add_argument("--rvq-max-active", type=int, help="Positive RVQ cap used when --rvq-layouts includes capped")
     parser.add_argument("--rvq-codebook-size", type=int, default=128)
     parser.add_argument("--rvq-sparsity-threshold", type=float, default=0.005)
     parser.add_argument("--hot-capacity", type=int, default=1024)
@@ -137,19 +152,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def first_non_none(*values):
+def first_present_int(*values: int | None) -> int:
     for value in values:
         if value is not None:
-            return value
-    return None
+            return int(value)
+    raise ValueError("expected at least one integer value")
 
 
 def apply_defaults(args: argparse.Namespace) -> argparse.Namespace:
     preset_values = LLAMA32_PRESETS.get(args.preset, {})
-    args.num_query_heads = int(first_non_none(args.num_query_heads, args.num_heads, preset_values.get("num_query_heads"), 4))
-    args.num_kv_heads = int(first_non_none(args.num_kv_heads, preset_values.get("num_kv_heads"), args.num_query_heads))
+    args.num_query_heads = first_present_int(args.num_query_heads, args.num_heads, preset_values.get("num_query_heads"), 4)
+    args.num_kv_heads = first_present_int(args.num_kv_heads, preset_values.get("num_kv_heads"), args.num_query_heads)
     args.num_heads = args.num_query_heads
-    args.head_dim = int(first_non_none(args.head_dim, preset_values.get("head_dim"), 128))
+    args.head_dim = first_present_int(args.head_dim, preset_values.get("head_dim"), 128)
     if args.output is None:
         if args.preset is None:
             args.output = Path("rfsn_v10_benchmark_results.csv")
@@ -175,6 +190,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("num_subspaces must be positive")
     if args.head_dim % args.num_subspaces != 0:
         raise ValueError("head_dim must be divisible by num_subspaces")
+    if args.rvq_max_active is not None and args.rvq_max_active <= 0:
+        raise ValueError("rvq_max_active must be positive when provided")
+    if RVQ_LAYOUT_CAPPED in args.rvq_layouts and args.rvq_max_active is None:
+        raise ValueError("--rvq-max-active is required when --rvq-layouts includes capped")
     if any(seq_len <= 0 for seq_len in args.sequence_lengths):
         raise ValueError("sequence lengths must be positive")
 
@@ -264,7 +283,7 @@ def build_visible_cache_keys(
 ) -> np.ndarray:
     key_parts: List[np.ndarray] = []
     if cache.num_hot > 0:
-        key_parts.append(rfsn._mx_to_np(cache.hot_keys, np.float32))
+        key_parts.append(rfsn._mx_to_np(cache.hot_keys[:cache.num_hot], np.float32))
     if cache.num_warm > 0:
         if warm_block_token_ranges is None:
             key_parts.append(rfsn._mx_to_np(cache.reconstruct_warm_keys(quantizer), np.float32))
@@ -299,7 +318,27 @@ def build_selected_dense_keys(
     return np.concatenate(key_parts, axis=0)
 
 
-def build_config(args: argparse.Namespace, mode: str, disk_cache_dir: Path) -> rfsn.RFSNConfig:
+def effective_rvq_layouts(args: argparse.Namespace, mode: str) -> List[str]:
+    if mode == "pq":
+        return [RVQ_LAYOUT_DISABLED]
+    return list(args.rvq_layouts)
+
+
+def resolve_rvq_max_active(args: argparse.Namespace, mode: str, rvq_layout: str) -> int:
+    if mode == "pq" or rvq_layout == RVQ_LAYOUT_DISABLED:
+        return 0
+    if rvq_layout == RVQ_LAYOUT_FIXED_DEFAULT:
+        return -1
+    if rvq_layout == RVQ_LAYOUT_DYNAMIC:
+        return 0
+    if rvq_layout == RVQ_LAYOUT_CAPPED:
+        if args.rvq_max_active is None:
+            raise ValueError("rvq_max_active must be set for capped layout")
+        return int(args.rvq_max_active)
+    raise ValueError(f"Unsupported RVQ layout: {rvq_layout}")
+
+
+def build_config(args: argparse.Namespace, mode: str, rvq_layout: str, disk_cache_dir: Path) -> rfsn.RFSNConfig:
     rvq_layers = 0 if mode == "pq" else args.num_rvq_layers
     return rfsn.RFSNConfig(
         hidden_dim=args.num_query_heads * args.head_dim,
@@ -310,6 +349,7 @@ def build_config(args: argparse.Namespace, mode: str, disk_cache_dir: Path) -> r
         pq_bits=args.pq_bits,
         subspace_dim=args.head_dim // args.num_subspaces,
         num_rvq_layers=rvq_layers,
+        rvq_max_active=resolve_rvq_max_active(args, mode, rvq_layout),
         rvq_codebook_size=args.rvq_codebook_size,
         rvq_sparsity_threshold=args.rvq_sparsity_threshold,
         hot_capacity=args.hot_capacity,
@@ -323,6 +363,7 @@ def build_config(args: argparse.Namespace, mode: str, disk_cache_dir: Path) -> r
 def run_trial(
     args: argparse.Namespace,
     mode: str,
+    rvq_layout: str,
     warm_read_mode: str,
     warm_selection_policy: str,
     seq_len: int,
@@ -333,7 +374,7 @@ def run_trial(
     prefix_lengths = sample_prefix_lengths(seq_len, args.step_tokens)
 
     with tempfile.TemporaryDirectory(prefix="rfsn_bench_") as tmpdir:
-        config = build_config(args, mode, Path(tmpdir))
+        config = build_config(args, mode, rvq_layout, Path(tmpdir))
         quantizer = rfsn.HybridQuantizerMLX(config)
         cache = rfsn.RFSNv10KVCacheMLX(config, layer_idx=0)
 
@@ -500,6 +541,8 @@ def run_trial(
 
         return {
             "mode": mode,
+            "rvq_layout": rvq_layout,
+            "rvq_max_active": config.rvq_max_active,
             "warm_read_mode": warm_read_mode,
             "warm_block_size_tokens": args.warm_block_size,
             "warm_selection_policy": warm_selection_policy,
@@ -578,11 +621,13 @@ def write_rows(output_path: Path, rows: Sequence[Dict[str, float | int | str]]) 
             writer.writerow(row)
 
 
-def row_identity(row: Dict[str, float | int | str]) -> tuple[str, str, str, int, int, int, int, int, int, int, int]:
+def row_identity(row: Mapping[str, str | int | float]) -> tuple[str, str, str, str, int, int, int, int, int, int, int, int, int]:
     return (
         str(row["mode"]),
+        str(row["rvq_layout"]),
         str(row["warm_read_mode"]),
         str(row["warm_selection_policy"]),
+        int(row["rvq_max_active"]),
         int(row["trial_index"]),
         int(row["seed"]),
         int(row["seq_len"]),
@@ -597,16 +642,19 @@ def row_identity(row: Dict[str, float | int | str]) -> tuple[str, str, str, int,
 def planned_row_identity(
     args: argparse.Namespace,
     mode: str,
+    rvq_layout: str,
     warm_read_mode: str,
     warm_selection_policy: str,
     seq_len: int,
     trial_index: int,
-) -> tuple[str, str, str, int, int, int, int, int, int, int, int]:
+) -> tuple[str, str, str, str, int, int, int, int, int, int, int, int, int]:
     seed = args.seed + trial_index
     return (
         mode,
+        rvq_layout,
         warm_read_mode,
         warm_selection_policy,
+        resolve_rvq_max_active(args, mode, rvq_layout),
         trial_index,
         seed,
         seq_len,
@@ -645,74 +693,82 @@ def main() -> None:
     args = parse_args()
     args = apply_defaults(args)
     validate_args(args)
+    if args.output is None:
+        raise ValueError("output path must be set after apply_defaults")
 
-    existing_rows = load_existing_rows(args.output) if args.resume else []
+    output_path = args.output
+
+    existing_rows = load_existing_rows(output_path) if args.resume else []
     completed_identities = {row_identity(row) for row in existing_rows}
     if args.resume and existing_rows:
-        print(f"resuming {args.output} with {len(existing_rows)} existing rows")
+        print(f"resuming {output_path} with {len(existing_rows)} existing rows")
 
-    handle, writer = open_result_writer(args.output, append=bool(existing_rows))
+    handle, writer = open_result_writer(output_path, append=bool(existing_rows))
     written_rows = 0
     skipped_rows = 0
 
     try:
         for seq_len in args.sequence_lengths:
             for mode in args.modes:
-                for warm_read_mode in args.warm_read_modes:
-                    selection_policies = ["all"] if warm_read_mode == "full" else args.warm_selection_policies
-                    for warm_selection_policy in selection_policies:
-                        for trial_index in range(args.trials):
-                            identity = planned_row_identity(
-                                args,
-                                mode,
-                                warm_read_mode,
-                                warm_selection_policy,
-                                seq_len,
-                                trial_index,
-                            )
-                            if identity in completed_identities:
-                                skipped_rows += 1
+                for rvq_layout in effective_rvq_layouts(args, mode):
+                    for warm_read_mode in args.warm_read_modes:
+                        selection_policies = ["all"] if warm_read_mode == "full" else args.warm_selection_policies
+                        for warm_selection_policy in selection_policies:
+                            for trial_index in range(args.trials):
+                                identity = planned_row_identity(
+                                    args,
+                                    mode,
+                                    rvq_layout,
+                                    warm_read_mode,
+                                    warm_selection_policy,
+                                    seq_len,
+                                    trial_index,
+                                )
+                                if identity in completed_identities:
+                                    skipped_rows += 1
+                                    print(
+                                        "skip mode={mode}/{rvq}/{warm_mode}/{policy} seq={seq} trial={trial}".format(
+                                            mode=mode,
+                                            rvq=rvq_layout,
+                                            warm_mode=warm_read_mode,
+                                            policy=warm_selection_policy,
+                                            seq=seq_len,
+                                            trial=trial_index,
+                                        )
+                                    )
+                                    continue
+
+                                row = run_trial(args, mode, rvq_layout, warm_read_mode, warm_selection_policy, seq_len, trial_index)
+                                writer.writerow(row)
+                                handle.flush()
+                                written_rows += 1
+                                completed_identities.add(row_identity(row))
+
                                 print(
-                                    "skip mode={mode}/{warm_mode}/{policy} seq={seq} trial={trial}".format(
-                                        mode=mode,
-                                        warm_mode=warm_read_mode,
-                                        policy=warm_selection_policy,
-                                        seq=seq_len,
-                                        trial=trial_index,
+                                    "mode={mode}/{rvq}/{warm_mode}/{policy} heads={query_heads}/{kv_heads} seq={seq} trial={trial} dense_ms={dense:.3f} cache_ms={cache:.3f} "
+                                    "warm_ms={warm:.3f} warm_blocks={blocks:.1f} coverage={coverage:.2f} output_mse={mse:.6e} cold={cold}".format(
+                                        mode=row["mode"],
+                                        rvq=row["rvq_layout"],
+                                        warm_mode=row["warm_read_mode"],
+                                        policy=row["warm_selection_policy"],
+                                        query_heads=row["num_query_heads"],
+                                        kv_heads=row["num_kv_heads"],
+                                        seq=row["seq_len"],
+                                        trial=row["trial_index"],
+                                        dense=row["avg_dense_ms"],
+                                        cache=row["avg_cache_total_ms"],
+                                        warm=row["avg_warm_reconstruct_ms"],
+                                        blocks=row["avg_warm_blocks"],
+                                        coverage=row["avg_warm_coverage_ratio"],
+                                        mse=row["mean_output_mse"],
+                                        cold=row["cold_spill_active"],
                                     )
                                 )
-                                continue
-
-                            row = run_trial(args, mode, warm_read_mode, warm_selection_policy, seq_len, trial_index)
-                            writer.writerow(row)
-                            handle.flush()
-                            written_rows += 1
-                            completed_identities.add(row_identity(row))
-
-                            print(
-                                "mode={mode}/{warm_mode}/{policy} heads={query_heads}/{kv_heads} seq={seq} trial={trial} dense_ms={dense:.3f} cache_ms={cache:.3f} "
-                                "warm_ms={warm:.3f} warm_blocks={blocks:.1f} coverage={coverage:.2f} output_mse={mse:.6e} cold={cold}".format(
-                                    mode=row["mode"],
-                                    warm_mode=row["warm_read_mode"],
-                                    policy=row["warm_selection_policy"],
-                                    query_heads=row["num_query_heads"],
-                                    kv_heads=row["num_kv_heads"],
-                                    seq=row["seq_len"],
-                                    trial=row["trial_index"],
-                                    dense=row["avg_dense_ms"],
-                                    cache=row["avg_cache_total_ms"],
-                                    warm=row["avg_warm_reconstruct_ms"],
-                                    blocks=row["avg_warm_blocks"],
-                                    coverage=row["avg_warm_coverage_ratio"],
-                                    mse=row["mean_output_mse"],
-                                    cold=row["cold_spill_active"],
-                                )
-                            )
     finally:
         handle.close()
 
     total_rows = len(existing_rows) + written_rows
-    print(f"wrote {total_rows} rows to {args.output} (new={written_rows}, skipped={skipped_rows})")
+    print(f"wrote {total_rows} rows to {output_path} (new={written_rows}, skipped={skipped_rows})")
 
 
 if __name__ == "__main__":

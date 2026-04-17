@@ -45,7 +45,12 @@ This repository is focused on correctness, explicit behavior, and honest benchma
 
 | File | Purpose |
 | --- | --- |
-| `rfsn_v10_mlx_ane_complete.py` | Core MLX prototype: quantizers, tiered cache, attention path, router helper, calibration, and correctness tests |
+| `rfsn_v10_mlx_ane_complete.py` | Compatibility facade: re-exports the public MLX prototype surface and keeps the correctness test runner |
+| `rfsn_v10_common.py` | Shared runtime, MLX import handling, config, dtype helpers, and array conversion utilities |
+| `rfsn_v10_attention.py` | Dense reference attention kernels and the streaming hot-plus-warm attention helpers |
+| `rfsn_v10_codec.py` | PQ and RVQ quantizers, hybrid decode helpers, and PQ calibration |
+| `rfsn_v10_cache.py` | Tiered KV cache orchestration, warm reconstruction, profiling metrics, and cold spill I/O |
+| `rfsn_v10_router.py` | Async disk-chunk router and prefetch helper |
 | `rfsn_v10_eval_benchmark.py` | Synthetic benchmark harness for dense vs cache-path comparisons |
 | `rfsn_v10_llama32_benchmark.py` | Convenience wrapper for Llama 3.2-shaped benchmark presets |
 | `rfsn_v10_unified_mac_launcher.py` | Backend detector and smoke launcher for MLX or PyTorch fallback |
@@ -205,9 +210,9 @@ The implementation uses two stages:
 Acceleration-oriented notes:
 
 - `hot_cache_dtype` controls the storage dtype of the preallocated hot KV buffers
-- `rvq_max_active` enables a fixed-width padded RVQ path for more JIT-friendly sparse-entry handling
-- if `rvq_max_active <= 0`, the prototype preserves dynamic sparse storage behavior
-   - applies corrections on decode
+- `rvq_max_active` now defaults to `-1`, which keeps the RVQ path fixed-width and MLX-native across the full row set while `entry_mask` carries sparsity
+- set `rvq_max_active` to a positive value to cap the fixed-width correction set for tighter storage bounds
+- set `rvq_max_active` to `0` only if you want the legacy dynamic sparse-compaction fallback for comparison
 
 `HybridQuantizerMLX` composes the two stages and returns:
 
@@ -385,6 +390,8 @@ This is what makes long 8k to 16k sweeps restartable without losing finished wor
 | `--num-subspaces` | PQ subspace count | `8` |
 | `--pq-bits` | PQ bit width | `8` |
 | `--num-rvq-layers` | RVQ layers for hybrid mode | `4` |
+| `--rvq-layouts` | RVQ layout sweep for hybrid mode | `fixed-default` |
+| `--rvq-max-active` | Positive cap used when `--rvq-layouts` includes `capped` | unset |
 | `--rvq-codebook-size` | RVQ codebook size | `128` |
 | `--rvq-sparsity-threshold` | RVQ sparsity threshold | `0.005` |
 
@@ -497,6 +504,22 @@ python3 rfsn_v10_eval_benchmark.py \
   --output /tmp/rfsn_v10_partial_compare.csv
 ```
 
+### Compare fixed-width RVQ vs legacy dynamic fallback
+
+```bash
+python3 rfsn_v10_eval_benchmark.py \
+  --sequence-lengths 2048 4096 8192 \
+  --step-tokens 512 \
+  --hot-capacity 512 \
+  --warm-capacity 8192 \
+  --modes hybrid \
+  --warm-read-modes blockwise \
+  --warm-selection-policies all recent \
+  --rvq-layouts fixed-default dynamic \
+  --trials 1 \
+  --output /tmp/rfsn_v10_rvq_layout_compare.csv
+```
+
 ### Run completed Llama-shaped long sweeps
 
 ```bash
@@ -538,6 +561,8 @@ The benchmark CSV is intentionally detailed. The full field list is defined in `
 - `num_subspaces`
 - `pq_bits`
 - `num_rvq_layers`
+- `rvq_layout`
+- `rvq_max_active`
 
 ### Cache and routing state
 
